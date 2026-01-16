@@ -1,0 +1,28 @@
+[project]
+name = "Electron Cloud Analysis"
+version = "1.0.0"
+description = "Electron Cloud Analysis (EcA) - A tool for analyzing electron cloud simulations."
+authors = [
+    {name = "Adam Furman", email = "adam.furman@cern.ch"},
+]
+requires-python = ">=3.8"
+license = {text = "GPLV3"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.urls]
+Homepage = "https://github.com/furmada/Electron-Cloud-Analysis"
+
+[project.dependencies]
+numpy = "^1.21.0"
+scipy = "^1.7.0"
+matplotlib = "^3.4.0"
+tinydb = "^4.7.0"
+
+[project.scripts]
+eca = "eca:main"
+
