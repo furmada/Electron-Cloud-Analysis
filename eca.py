@@ -747,19 +747,19 @@ class FurmanPhotoFit(BeforeBunchFit):
         self.bound(bounds)
         return super().fit(model, refit)
 
-def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True, **search) -> list[ECModel]:
+def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True, **search):
     """
     For the database db, apply the Fit to each result of the search (using where()),
     returning an ECModel instance for each result.
     """
-    models = [ECModel(db.db, result) for result in db.where(**search)]
-    for i, model in enumerate(models):
+    results = db.where(**search)
+    for i, result in enumerate(results):
+        model = ECModel(db.db, result)
         fit.fit(model, refit=refit)
-        if verbose: print("{:<3}/{} {}".format(i, len(models), "S" if fit._mget("success", model) else "F"), end="\r")
+        if isinstance(db.db.storage, CachingMiddleware):
+            db.db.storage.flush()
+        if verbose: print("{:<3}/{} {}".format(i, len(results), "S" if fit._mget("success", model) else "F"), end="\r")
     if verbose: print("Done.        ")
-    if isinstance(db.db.storage, CachingMiddleware):
-        db.db.storage.flush()
-    return models
 
 if __name__ == "__main__":
     from sys import argv

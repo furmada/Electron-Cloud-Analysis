@@ -1,6 +1,4 @@
-from eca01 import *
-import numpy as np
-import scipy
+from eca import *
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.colors import Colormap, Normalize
@@ -50,8 +48,8 @@ def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None
         ax.set_title("SEY={:.2f}, I={:.2E}, B={}".format(model.del_max, model.fact_beam, model.B_multip))
         ax.legend()
 
-def versus_plot(db: SimDB, paramA: str, paramB: str, colorBy: str | None = None,
-                size: tuple[int, int] | None = (8, 6), dot_size: int = 10, log: tuple[bool, bool] = (False, False), colormap: None | Colormap = None, **restrict):
+def versus_plot(db: SimDB, paramA: str, paramB: str, colorBy: str | None = None, size: tuple[int, int] | None = (8, 6), 
+                dot_size: int = 10, log: tuple[bool, bool] = (False, False), colormap: None | Colormap = None, **restrict) -> tuple:
     """
     Produce a plot of param B vs. paramA, optionally colored using param colorBy, under restrict conditions.
     """
@@ -78,3 +76,4 @@ def versus_plot(db: SimDB, paramA: str, paramB: str, colorBy: str | None = None,
         ax.set_ylabel(paramB)
         ax.set_title("{}({}){}".format(paramB, paramA, "by " + colorBy if not colorBy is None else ""))
 
+    return (table[0][0], table[0][1]) if colorBy is None else (table[0][0], table[0][1], table[1][1])
