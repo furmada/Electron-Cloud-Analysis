@@ -5,6 +5,7 @@ EcA - Electron Cloud Analysis v1
 
 For use with PyECLOUD.
 """
+from os.path import isfile
 from typing import Callable, Iterable
 
 import numpy as np
@@ -13,6 +14,7 @@ from tinydb import JSONStorage, TinyDB, Query
 from tinydb.storages import MemoryStorage, JSONStorage
 from tinydb.table import Document
 from tinydb.middlewares import CachingMiddleware
+from shutil import copy2
 
 import os
 
@@ -39,10 +41,90 @@ class DBFolder(object):
 
     def _scan(self):
         self.sim_folders = set()
+        self.run_folders = set()
         for r, _, files in os.walk(self.path):
-            if sum([(1 if f in files else 0) for f in FILENAMES.values()]) == len(FILENAMES):
+            count = sum([(1 if f in files else 0) for f in FILENAMES.values()])
+            if count == len(FILENAMES):
                 self.sim_folders.add(r)
+            elif count == len(FILENAMES) - 1:
+                self.run_folders.add(r)
         self.sim_folders = list(sorted(self.sim_folders))
+        self.run_folders = list(sorted(self.run_folders))
+
+class TemplateSim(object):
+    """
+    A single (existing) simulation folder that can be used as a template
+    to generate new simulations by changing parameters.
+    """
+    def __init__(self, path: str):
+        self.path = os.path.normpath(os.path.abspath(path))
+        self.property_map = {}
+        self.defaults = {}
+        for filename in FILENAMES:
+            if filename != FILENAMES["data"]:
+                try:
+                    for param, value in SimDB.parse_input_file(os.path.join(self.path, filename)).items():
+                        self.property_map[param] = filename
+                        self.defaults[param] = value
+                except:
+                    raise ValueError("The configuration file {} does not exist in {}, or it is malformed.".format(filename, self.path))
+        self.resources = []
+        for item in os.listdir(self.path):
+            if os.path.isfile(item) and not item in FILENAMES.values():
+                self.resources.append(item)
+    
+    def spawn(self, path: str, **changes):
+        """Spawn a new simulation based on the template, with the changes applied."""
+        path = os.path.normpath(os.path.abspath(path))
+        if os.path.exists(path) and os.path.exists(os.path.join(path, FILENAMES["data"])):
+            raise ValueError("The desired destination {} already contains an output data file!".format(path))
+        if not os.path.exists(path):
+            os.mkdir(path)
+
+        values = {**self.defaults, **changes}
+        for filename in FILENAMES:
+            if filename != FILENAMES["data"]:
+                this_file = [prop for prop in values.keys() if prop in self.property_map and self.property_map[prop] == filename]
+                contents = "#PyECLOUD Configuration from Template {}\n\n".format(self.path)
+                for prop in sorted(this_file):
+                    value = values[prop]
+                    if os.path.exists(value) and os.path.isfile(value) and os.path.commonpath((value, self.path)) == self.path:
+                        # This is a filepath argument within the template. We also need this file.
+                        rebase = os.path.join(path, os.path.basename(value))
+                        copy2(value, rebase)
+                        value = rebase
+                    contents += "{} = {}\n".format(prop, value if not isinstance(value, np.ndarray) else value.tolist())
+                with open(os.path.join(path, filename), "w") as f:
+                    f.write(contents)
+        for resource in self.resources:
+            copy2(os.path.join(self.path, resource), os.path.join(path, resource))
+
+    @staticmethod
+    def generate_sweep(parameters: Iterable, sweep: Iterable) -> list[dict]:
+        """
+        Generate one set of changes for every combination of values for all parameters to be swept.
+        Each parameter should correspond to one entry in sweep.
+        Each entry in sweep should be a list of values that parameter can take.
+        """
+        parameters = list(parameters)
+        sweep = list(sweep)
+        lengths = [len(list(s)) for s in sweep]
+        counters = np.zeros(len(parameters))
+
+        configurations = []
+        for _ in range(np.prod(np.array(lengths))):
+            configurations.append({
+                parameters[c]: sweep[c][counters[c]] for c in range(counters.size)
+            })
+            
+            j = len(counters) - 1
+            counters[j] += 1
+            while counters[j] >= lengths[j]:
+                counters[j] = 0
+                j -= 1
+                counters[j] += 1
+        return configurations
+                
 
 class SimDB(object):
     """
