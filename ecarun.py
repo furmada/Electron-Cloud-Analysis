@@ -73,17 +73,19 @@ class RunSLURM(RunLocal):
         - python: on the REMOTE machine
         - ecloud: on the REMOTE machine
         - submission_name: folder to house all submissions
+        - remote_folder: Folder in which the submission folder is located
         - username: to log in as (default: current user)
         - hostname: to log in to (default: localhost)
     """
     def __init__(self, job_folders: list[str], python: str = "python", ecloud: str = "./",
-                 submission_name: str | None = None, username: str | None = None, hostname: str = "localhost"):
+                 submission_name: str | None = None, remote_folder: str | None = None, username: str | None = None, hostname: str = "localhost"):
         super().__init__(job_folders, python, ecloud)
         self.username = os.getlogin() if username is None else username
         self.hostname = hostname
         self.name = datetime.now().strftime("%d%m%Y_%H") if submission_name is None else submission_name
-        self.remote_folder = "/home/{}/{}/".format(self.username, self.name)
+        self.remote_folder = "/home/{}/{}/".format(self.username, self.name) if remote_folder is None else os.path.join(remote_folder, self.name)
         self.remote_folders = [os.path.join(self.remote_folder, os.path.basename(f)) for f in self.job_folders]
+        self.include_files = []
 
     @staticmethod
     def compress(destination: str, folders: list[str]):
@@ -106,7 +108,7 @@ class RunSLURM(RunLocal):
         tarball = os.path.abspath(os.path.join("./", self.name + ".tar"))
         upload_tarball = os.path.abspath(os.path.join(self.remote_folder, "..", os.path.basename(tarball)))
         submit_script = self.make_submit_script(upload_tarball)
-        RunSLURM.compress(tarball, self.job_folders + [submit_script])
+        RunSLURM.compress(tarball, self.job_folders + [submit_script] + self.include_files)
         try:
             sp_run([
                 "scp", "-r", tarball, "{}@{}:{}".format(self.username, self.hostname, upload_tarball)
@@ -183,3 +185,53 @@ done""".format(
             ])
         except Exception as e:
             if verbose: print("Failed to retrieve:", e)
+
+class RunCondor(RunSLURM):
+    """
+    Run on HTCondor (lxplus)
+    Ensure you have installed PyECLOUD to AFS (accessible by condor)
+    """
+    CONDOR_TEMPLATE = """
+universe = vanilla
+executable = $(dirname)/run.sh
+arguments = ""
+output = $(dirname)/htcondor.out
+error = $(dirname)/htcondor.err
+log = $(dirname)/htcondor.log
+transfer_output_files = ""
++MaxRuntime = 518400
+queue dirname from {folder_listfile}"""
+
+    def __init__(self, job_folders: list[str], python: str = "python", ecloud: str = "./",
+                submission_name: str | None = None, remote_folder: str | None = None, username: str | None = None, hostname: str = "lxplus.cern.ch"):
+        if username is None:
+            username = os.getlogin()
+        if remote_folder is None:
+            remote_folder = "/afs/cern.ch/work/{}/{}/".format(username[0], username)
+        super().__init__(job_folders, python, ecloud, submission_name, remote_folder, username, hostname)
+
+    def make_submit_script(self, upload_tarball: str) -> str:
+        for r, f in zip(self.remote_folders, self.job_folders):
+            self.make_script(r, os.path.join(os.path.abspath(f), "run.sh"))
+        folder_listfile = os.path.abspath("./folders.txt")
+        with open(folder_listfile, "w") as f:
+            f.write("\n".join(self.remote_folders))
+        sub_file = os.path.abspath("./htcondor.sub")
+        with open(sub_file, "w") as f:
+            f.write(RunCondor.CONDOR_TEMPLATE.format(folder_listfile=os.path.join(self.remote_folder, os.path.basename(folder_listfile))))
+        submit_script = os.path.abspath("./" + self.name + "_submit.sh")
+        with open(submit_script, "w") as f:
+            f.write("""#!/bin/bash
+            cd {}
+            condor_submit htcondor.sub
+            condor_q --nobatch
+            rm {} {} {}
+            """.format(self.remote_folder, 
+                       os.path.join(self.remote_folder, os.path.basename(folder_listfile)),
+                       os.path.join(self.remote_folder, os.path.basename(sub_file)),
+                       upload_tarball))
+        s = os.stat(submit_script)
+        os.chmod(submit_script, s.st_mode | stat.S_IEXEC)
+        # Make sure we also copy over the additional files
+        self.include_files = [folder_listfile, sub_file]
+        return submit_script
