@@ -60,7 +60,7 @@ class TemplateSim(object):
         self.path = os.path.normpath(os.path.abspath(path))
         self.property_map = {}
         self.defaults = {}
-        for filename in FILENAMES:
+        for filename in FILENAMES.values():
             if filename != FILENAMES["data"]:
                 try:
                     for param, value in SimDB.parse_input_file(os.path.join(self.path, filename)).items():
@@ -70,7 +70,7 @@ class TemplateSim(object):
                     raise ValueError("The configuration file {} does not exist in {}, or it is malformed.".format(filename, self.path))
         self.resources = []
         for item in os.listdir(self.path):
-            if os.path.isfile(item) and not item in FILENAMES.values():
+            if os.path.isfile(os.path.join(self.path, item)) and not item in FILENAMES.values():
                 self.resources.append(item)
     
     def spawn(self, path: str, **changes):
@@ -82,18 +82,21 @@ class TemplateSim(object):
             os.mkdir(path)
 
         values = {**self.defaults, **changes}
-        for filename in FILENAMES:
+        for filename in FILENAMES.values():
             if filename != FILENAMES["data"]:
                 this_file = [prop for prop in values.keys() if prop in self.property_map and self.property_map[prop] == filename]
                 contents = "#PyECLOUD Configuration from Template {}\n\n".format(self.path)
                 for prop in sorted(this_file):
                     value = values[prop]
-                    if os.path.exists(value) and os.path.isfile(value) and os.path.commonpath((value, self.path)) == self.path:
+                    if type(value) == str and os.path.exists(value) and os.path.isfile(value) and os.path.commonpath((value, self.path)) == self.path:
                         # This is a filepath argument within the template. We also need this file.
                         rebase = os.path.join(path, os.path.basename(value))
                         copy2(value, rebase)
                         value = rebase
-                    contents += "{} = {}\n".format(prop, value if not isinstance(value, np.ndarray) else value.tolist())
+                    if prop == "logfile_path": value = "log.txt"
+                    elif prop == "progress_path": value = "progress"
+                    elif prop == "stopfile": value = "stop"
+                    contents += "{} = {}\n".format(prop, ("\"" + value + "\"" if type(value) == str else value) if not isinstance(value, np.ndarray) else value.tolist())
                 with open(os.path.join(path, filename), "w") as f:
                     f.write(contents)
         for resource in self.resources:
@@ -109,7 +112,7 @@ class TemplateSim(object):
         parameters = list(parameters)
         sweep = list(sweep)
         lengths = [len(list(s)) for s in sweep]
-        counters = np.zeros(len(parameters))
+        counters = np.zeros(len(parameters), dtype=int)
 
         configurations = []
         for _ in range(np.prod(np.array(lengths))):
