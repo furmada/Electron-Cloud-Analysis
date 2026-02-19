@@ -39,12 +39,12 @@ def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None
                         alpha=0.2, label="Err: {}".format(fit.name))
             else:
                 print("Fitting failed: {}".format(getattr(model, "_"+fit.name+"_fitting_error")))
-            ax.scatter(B, F, s=1, label="Data: {}".format(fit.name))
+            ax.scatter(B, F, s=1, c="k", label="Data: {}".format(fit.name))
     if log[0]: ax.set_xscale("log")
     if log[1]: ax.set_yscale("log")
     if not size is None:
         ax.set_xlabel("Bunch Passage")
-        ax.set_ylabel("Electron Linear Density")
+        ax.set_ylabel("N. Electrons")
         ax.set_title("SEY={:.2f}, I={:.2E}, B={}".format(model.del_max, model.fact_beam, model.B_multip))
         ax.legend()
 

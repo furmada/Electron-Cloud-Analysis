@@ -183,6 +183,7 @@ done""".format(
             sp_run([
                 "rm", "-rf", unpack_dir
             ])
+            os.remove(retrieve_script)
         except Exception as e:
             if verbose: print("Failed to retrieve:", e)
 

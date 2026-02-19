@@ -556,14 +556,44 @@ class ECModel(SynchedEntry):
         """
         self.Ne_0 = self.N_electrons[np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]]
 
+class DataSelector(object):
+    """
+    A DataSelector chooses data for fitting or other analysis from an ECModel.
+    """
+    def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
+        return (model.time, model.N_electrons)
+
+class BeforeBunchSelector(DataSelector):
+    """
+    Selects the points immediately before each bunch passage as the fitting points.
+    """
+    def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
+        pre_bp = np.array(model.time_to_index(model.bunch_times - model.half_bunch))
+        valid = pre_bp < model.time.size
+        return (model.time[pre_bp[valid]], model.N_electrons[pre_bp[valid]])
+
+class BunchAverageSelector(DataSelector):
+    """
+    Selects the points immediately before each bunch passage as the fitting points.
+    """
+    def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
+        pre_bp = np.array(model.time_to_index(model.bunch_times - model.half_bunch))
+        valid = pre_bp < model.time.size
+        pre_bp = pre_bp[valid]
+        averages = np.zeros_like(pre_bp)
+        for b, start in enumerate(pre_bp):
+            averages[b] = np.mean(model.N_electrons[start:start+model.bunch_step])
+        return ((model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid], averages)
+
 class Fit(object):
     """
     A Fit is the base class for applying a curve fit to an ECModel.
     """
-    def __init__(self, name: str, function: str, variables: Iterable[str]):
+    def __init__(self, name: str, function: str, variables: Iterable[str], selector: DataSelector):
         self.name = name
         self.function = function
         self.variables = tuple(variables)
+        self.selector = selector
         self._reset_state()
 
     def _reset_state(self):
@@ -622,9 +652,9 @@ class Fit(object):
 
     def select_data(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
         """
-        Picks data from the model to fit to. Override.
+        Picks data from the model to fit to.
         """
-        return (model.time[:model.cutoff], model.N_electrons[:model.cutoff])
+        return self.selector.select(model)
 
     def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
         """
@@ -705,17 +735,8 @@ class Fit(object):
             if hasattr(model, "_"+self.name+"_success"):
                 delattr(model, self.name+"_success")
 
-class BeforeBunchFit(Fit):
-    """
-    Selects the points immediately before each bunch passage as the fitting points.
-    """
 
-    def select_data(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        pre_bp = np.array(model.time_to_index(model.bunch_times - model.half_bunch))
-        valid = pre_bp < model.time.size
-        return (model.time[pre_bp[valid]], model.N_electrons[pre_bp[valid]])
-
-class FurmanNoPhotoFit(BeforeBunchFit):
+class FurmanNoPhotoFit(Fit):
     """
     "FURMAN" FULL MODEL (B) - NO PHOTOEMISSION
     x  -> scaled time
@@ -726,11 +747,12 @@ class FurmanNoPhotoFit(BeforeBunchFit):
 
     FURMAN_NO_PHOTO = """(y0 * yc * np.exp(beta * yc * x)) / (yc + y0 * (np.exp(beta * yc * x) - 1))"""
 
-    def __init__(self):
+    def __init__(self, selector: None | DataSelector = None):
         super().__init__(
             "furman_np",
             FurmanNoPhotoFit.FURMAN_NO_PHOTO,
-            ("x", "yc", "beta", "y0")
+            ("x", "yc", "beta", "y0"),
+            BunchAverageSelector() if selector is None else selector
         )
 
     def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
@@ -749,15 +771,15 @@ class FurmanNoPhotoFit(BeforeBunchFit):
         xdata, ydata = self.select_data(model)
         _, scale_y = self.scale_factor(model, xdata, ydata)
         self.fix({"y0": model.Ne_0 * scale_y})
-        mslope = np.argmin(np.square(ydata - (ydata[-1]/2)))
         if model.buildup:
+            mslope = np.argmin(np.square(ydata - ((ydata[-1] - ydata[0])/2)))
             bounds = {
                 "yc": (model.Ne_0 * scale_y, 2*model.N_electrons[model.cutoff]*scale_y),
-                "beta": (0, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y))
+                "beta": (0, max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
             }
             self.initial({
                 "yc": model.N_electrons[model.cutoff]*scale_y,
-                "beta": 4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)
+                "beta": min(1, abs(4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)))
             })
         else:
             bounds = {
@@ -766,12 +788,12 @@ class FurmanNoPhotoFit(BeforeBunchFit):
             }
             self.initial({
                 "yc": 2*model.Ne_0*scale_y,
-                "beta": -1
+                "beta": -0.1
             })
         self.bound(bounds)
         return super().fit(model, refit)
 
-class FurmanPhotoFit(BeforeBunchFit):
+class FurmanPhotoFit(Fit):
     """
     "FURMAN" FULL MODEL (B) - NO PHOTOEMISSION
     x  -> scaled time
@@ -783,11 +805,12 @@ class FurmanPhotoFit(BeforeBunchFit):
 
     FURMAN_PHOTO = """0.5*(yc + np.sqrt(yc**2 + (4*alpha/beta))*np.tanh((x/2)*np.sqrt(beta*(4*alpha + (yc**2)*beta)) - np.arctanh((yc - 2*y0)*np.sqrt(beta / (4*alpha + (yc**2)*beta)))))"""
 
-    def __init__(self):
+    def __init__(self, selector: None | DataSelector = None):
         super().__init__(
             "furman_p",
             FurmanPhotoFit.FURMAN_PHOTO,
-            ("x", "yc", "alpha", "beta", "y0")
+            ("x", "yc", "alpha", "beta", "y0"),
+            BunchAverageSelector() if selector is None else selector
         )
 
     def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
