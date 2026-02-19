@@ -3,15 +3,6 @@
 
 **Electron Cloud Analysis (EcA)** is a Python package designed for analyzing and visualizing data from PyECLOUD simulations. It provides tools for managing simulation data, fitting models, and plotting results.
 
-## Table of Contents
-
-- [Description](#description)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Public Functions](#public-functions)
-- 
----
-
 ## Description
 
 EcA is a toolkit for working with PyECLOUD simulation data. It allows users to:
@@ -20,12 +11,13 @@ EcA is a toolkit for working with PyECLOUD simulation data. It allows users to:
 - **Query and analyze** simulation data.
 - **Fit models** to simulation data.
 - **Visualize** simulation results and model fits.
+- **Submit** new simulations to computing clusters.
 
-The package is structured into two main modules:
+The package is structured into three modules:
 
 - `eca.py`: Core functionality for managing simulation data and fitting models.
 - `ecaplots.py`: Functions for plotting simulation data and model fits.
-
+- `ecarun.py`: Tools for running new simulations on computing clusters.
 ---
 
 ## Installation
@@ -76,7 +68,11 @@ results = sim_db.where(_=lambda result: filter_fn(result)
 
 ### Fitting Models
 
-To fit models to simulation data, use one of the `Fit` subclasses:
+To fit models to simulation data, use one of the `Fit` subclasses.
+```python
+fit_np = eca.FurmanNoPhotoFit()
+fit_p = eca.FurmanPhotoFit()
+```
 
 ### Plotting Results
 
@@ -84,39 +80,61 @@ To visualize simulation data and model fits, use the `model_plot` function:
 
 ```python
 from ecaplots import model_plot
-
-# Plot the model and fits
 model_plot(model=model, fits=[fit], size=(10, 5), log=(False, False), show_error=True)
 ```
 
----
+For a visualization of variable `x` vs `y` (optionally colored by `c`), use the `versus_plot` function:
 
-### `eca.py`
+```python
+from ecaplots import versus_plot
+ecp.versus_plot(db, "<x>", "<y>", "<c>", size=(10, 5), **args_to_where)
+```
+The `**args_to_where` are passed on to `db.where`, which can be used to filter results.
 
-#### `DBFolder`
+### Creating New Simulations
 
-- **Description**: A source folder for building a database. Recursively searches the path for folders containing all required files corresponding to a finished simulation.
-- **Parameters**:
-  - `path`: The path to the folder to scan.
-  - `**shared_properties`: Meta-attributes that all simulations found within this folder will inherit.
+Creating new simulations requires one simulation as a "template". Unless explicitly changed, the variables
+in your new simulation will mirror the values of the template.
 
-#### `SimDB`
+```python
+template = eca.TemplateSim("./configurations/new_template")
+```
 
-- **Description**: A database of PyECLOUD simulations that can be searched and queried.
-- **Parameters**:
-  - `db_file`: The file path or `TinyDB` instance to use for the database.
-  - `db_folders`: A list of `DBFolder` instances to add to the database.
-  - `verbose`: If `True`, prints progress information.
+The template can be used to generate a parameter sweep of one or several variables:
+```python
+# Sweep in B, SEY, Intensity
+fact_beam_vect = [2.150e+10, 6.020e+10, 9.890e+10, 1.376e+11, 1.763e+11, 2.150e+11, 2.365e11]
+del_max_vect = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6]
+B_multip_vect = [[round(0.005 + 0.005*b, 3)] for b in range(9)]
+work_dir = "./pyecloud_jobs"
 
-### `ecaplots.py`
+confs = template.generate_sweep(
+    ["fact_beam", "del_max", "B_multip"],
+    [fact_beam_vect, del_max_vect, B_multip_vect])
+```
 
-#### `model_plot`
+`confs` is a list of dictionaries that modify the default template values.
 
-- **Description**: Plots the raw data and each fit if it succeeded.
-- **Parameters**:
-  - `model`: The model to plot.
-  - `fits`: An iterable of `Fit` instances to plot.
-  - `size`: The size of the plot or an `Axes` object.
-  - `log`: A tuple indicating whether to use a logarithmic scale for the x and y axes.
-  - `show_error`: If `True`, shows the error range for each fit.
-  - `refit`: If `True`, refits the model before plotting.
+To spawn an actual simulation, use the `template.spawn` method:
+```python
+folders = []
+for configuration in confs:
+    f = work_dir + "B_{B_multip[0]}_I_{fact_beam:.2E}_S_{del_max:.2f}".format(**c)
+    template.spawn(f, **c)
+    folders.append(f)
+```
+
+*Note that the folder names for each simulation should be unique!*
+
+Submit a list of simulation folders using a simulation `Runner`.
+```python
+runner = ecarun.RunLocal(folders, python=executable, ecloud="./")
+runner = ecarun.RunSLURM(folders, python="<python executable>", ecloud="<PyECLOUD directory>", submission_name="<name>", username="<login>", hostname="<slurm host>")
+runner = ecarun.RunCondor(folders, python="<python executable>", ecloud="<PyECLOUD directory>", submission_name="<name>", username="<login>", hostname="lxplus.cern.ch")
+```
+
+You can then submit the folders using `runner.submit()` and retrieve finished simulations using `runner.retrieve()`.
+
+*Submitting and retrieving will execute shell commands on a remote machine. Ensure you understand the code before running at your own risk.*
+
+It is recommended that you have password-free (e.g. SSH key) access to the `hostname` server.
