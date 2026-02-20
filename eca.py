@@ -829,31 +829,25 @@ class FurmanPhotoFit(Fit):
         xdata, ydata = self.select_data(model)
         _, scale_y = self.scale_factor(model, xdata, ydata)
         self.fix({"y0": model.Ne_0 * scale_y})
-        mslope = np.argmin(np.square(ydata - (ydata[-1]/2)))
         if model.buildup:
+            mslope = np.argmin(np.square(ydata - (ydata[-1]/2)))
             bounds = {
                 "yc": (model.Ne_0 * scale_y, 2*model.N_electrons[model.cutoff]*scale_y),
-                "alpha": (0, 5*model.k_pe_st),
-                "beta": (0, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y))
+                "alpha": (0, np.inf),
+                "beta": (0, max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
             }
             self.initial({
                 "yc": model.N_electrons[model.cutoff]*scale_y,
-                "alpha": model.k_pe_st,
-                "beta": 4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)
+                "alpha": 0,
+                "beta": min(1, abs(4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)))
             })
+            self.bound(bounds)
+            return super().fit(model, refit)
         else:
-            bounds = {
-                "yc": (0, np.inf),
-                "alpha": (0, 5*model.k_pe_st),
-                "beta": (-np.inf, 0)
-            }
-            self.initial({
-                "yc": 2*model.Ne_0*scale_y,
-                "alpha": model.k_pe_st,
-                "beta": -1
-            })
-        self.bound(bounds)
-        return super().fit(model, refit)
+            self._mset("success", False, model)
+            setattr(model, "_"+self.name+"_fitting_error", ValueError("Cannot fit photoemission model for non-buildup simulation."))
+            return None
+        
 
 def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True, **search):
     """
