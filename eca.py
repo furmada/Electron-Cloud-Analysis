@@ -18,22 +18,22 @@ from shutil import copy2
 
 import os
 
-FILENAMES = {
-    "data": "Pyecltest.mat",
-    "sey": "secondary_emission_parameters.input",
-    "machine": "machine_parameters.input",
-    "simulation": "simulation_parameters.input",
-    "beam": "beam.beam"
-}
-
 class DBFolder(object):
     """
-    A source folder for building a database.
+    A source folder for building a database, containing non-instability simulations.
     Recursively searches the path for folders containing all FILENAMES
     corresponding to a finished simulation.
     -> shared_properties are meta-attributes that all simulations found
         within this DBFolder will inherit.
     """
+    FILENAMES = {
+        "data":       "Pyecltest.mat",
+        "sey":        "secondary_emission_parameters.input",
+        "machine":    "machine_parameters.input",
+        "simulation": "simulation_parameters.input",
+        "beam":       "beam.beam"
+    }
+
     def __init__(self, path: str, **shared_properties):
         self.path = path
         self.shared_properties = shared_properties
@@ -43,13 +43,62 @@ class DBFolder(object):
         self.sim_folders = set()
         self.run_folders = set()
         for r, _, files in os.walk(self.path):
-            count = sum([(1 if f in files else 0) for f in FILENAMES.values()])
-            if count == len(FILENAMES):
+            count = sum([(1 if f in files else 0) for f in DBFolder.FILENAMES.values()])
+            if count == len(DBFolder.FILENAMES):
                 self.sim_folders.add(r)
-            elif count == len(FILENAMES) - 1:
+            elif count == len(DBFolder.FILENAMES) - 1:
                 self.run_folders.add(r)
         self.sim_folders = list(sorted(self.sim_folders))
         self.run_folders = list(sorted(self.run_folders))
+
+    def config_files_for(self, path: str) -> dict:
+        """
+        Return a dictionary of configuration filepaths for a simulation folder.
+        """
+        return {k: os.path.join(path, f) for k, f in DBFolder.FILENAMES.items()}
+
+class InstabilityDBFolder(DBFolder):
+    """
+    A source folder for building a database, contianing instability simulations.
+    Recursively searches the path for folders containing all FILENAMES
+    corresponding to a finished simulation.
+    -> shared_properties are meta-attributes that all simulations found
+        within this DBFolder will inherit.
+    """
+    CONFIG_FOLDER = "pyecloud_config"
+    FILENAMES = {
+        "sey":        "secondary_emission_parameters.input",
+        "machine":    "machine_parameters.input",
+        "simulation": "simulation_parameters.input"
+    }
+    INSTAB_CONF_FILE = "Simulation_parameters.py"
+
+    def __init__(self, path: str, **shared_properties):
+        super().__init__(path, **shared_properties)
+
+    def _scan(self):
+        self.sim_folders = set()
+        self.run_folders = set()
+        for r, folders, files in os.walk(self.path):
+            if InstabilityDBFolder.CONFIG_FOLDER in folders:
+                count = sum(
+                    [(1 if os.path.exists(os.path.join(r, InstabilityDBFolder.CONFIG_FOLDER, f)) else 0)
+                    for f in InstabilityDBFolder.FILENAMES.values()])
+                if count == len(InstabilityDBFolder.FILENAMES):
+                    if sum([1 if f.endswith(".h5") else 0 for f in files]) > 0:
+                        self.sim_folders.add(r)
+                    else:
+                        self.run_folders.add(r)
+        self.sim_folders = list(sorted(self.sim_folders))
+        self.run_folders = list(sorted(self.run_folders))
+
+    def config_files_for(self, path: str) -> dict:
+        """
+        Return a dictionary of configuration filepaths for a simulation folder.
+        """
+        base = {k: os.path.join(path, InstabilityDBFolder.CONFIG_FOLDER, f) for k, f in InstabilityDBFolder.FILENAMES.items()}
+        base["instability"] = os.path.join(path, InstabilityDBFolder.INSTAB_CONF_FILE)
+        return base
 
 class TemplateSim(object):
     """
@@ -60,8 +109,8 @@ class TemplateSim(object):
         self.path = os.path.normpath(os.path.abspath(path))
         self.property_map = {}
         self.defaults = {}
-        for filename in FILENAMES.values():
-            if filename != FILENAMES["data"]:
+        for filename in DBFolder.FILENAMES.values():
+            if filename != DBFolder.FILENAMES["data"]:
                 try:
                     for param, value in SimDB.parse_input_file(os.path.join(self.path, filename)).items():
                         self.property_map[param] = filename
@@ -70,29 +119,31 @@ class TemplateSim(object):
                     raise ValueError("The configuration file {} does not exist in {}, or it is malformed.".format(filename, self.path))
         self.resources = []
         for item in os.listdir(self.path):
-            if os.path.isfile(os.path.join(self.path, item)) and not item in FILENAMES.values():
+            if os.path.isfile(os.path.join(self.path, item)) and not item in DBFolder.FILENAMES.values():
                 self.resources.append(item)
     
-    def spawn(self, path: str, **changes):
+    def spawn(self, path: str, **changes) -> str:
         """Spawn a new simulation based on the template, with the changes applied."""
         path = os.path.normpath(os.path.abspath(path))
-        if os.path.exists(path) and os.path.exists(os.path.join(path, FILENAMES["data"])):
+        if os.path.exists(path) and os.path.exists(os.path.join(path, DBFolder.FILENAMES["data"])):
             raise ValueError("The desired destination {} already contains an output data file!".format(path))
         if not os.path.exists(path):
             os.mkdir(path)
 
         values = {**self.defaults, **changes}
-        for filename in FILENAMES.values():
-            if filename != FILENAMES["data"]:
+        for filename in DBFolder.FILENAMES.values():
+            if filename != DBFolder.FILENAMES["data"]:
                 this_file = [prop for prop in values.keys() if prop in self.property_map and self.property_map[prop] == filename]
                 contents = "#PyECLOUD Configuration from Template {}\n\n".format(self.path)
                 for prop in sorted(this_file):
                     value = values[prop]
-                    if type(value) == str and os.path.exists(value) and os.path.isfile(value) and os.path.commonpath((value, self.path)) == self.path:
-                        # This is a filepath argument within the template. We also need this file.
-                        rebase = os.path.join(path, os.path.basename(value))
-                        copy2(value, rebase)
-                        value = rebase
+                    if type(value) == str and os.path.exists(value) and os.path.isfile(value):
+                        value = os.path.normpath(os.path.abspath(value))
+                        if os.path.commonpath((value, self.path)) == self.path:
+                            # This is a filepath argument within the template. We also need this file.
+                            rebase = os.path.join(path, os.path.basename(value))
+                            copy2(value, rebase)
+                            value = os.path.basename(rebase)
                     if prop == "logfile_path": value = "log.txt"
                     elif prop == "progress_path": value = "progress"
                     elif prop == "stopfile": value = "stop"
@@ -101,6 +152,7 @@ class TemplateSim(object):
                     f.write(contents)
         for resource in self.resources:
             copy2(os.path.join(self.path, resource), os.path.join(path, resource))
+        return path
 
     @staticmethod
     def generate_sweep(parameters: Iterable, sweep: Iterable) -> list[dict]:
@@ -152,6 +204,8 @@ class SimDB(object):
                 if verbose: print("{:<3}/{}".format(i, len(to_add)), end="\r")
                 self._add_single(*entry)
             if verbose: print("Done.      ")
+            if isinstance(self.db.storage, CachingMiddleware):
+                self.db.storage.flush()
 
     @staticmethod
     def parse_input_file(path: str) -> dict:
@@ -186,9 +240,9 @@ class SimDB(object):
         """
         parameters = {**db_folder.shared_properties}
         # Read all input parameter files
-        for name, path in FILENAMES.items():
+        for name, path in db_folder.config_files_for(sim_folder).items():
             if name != "data":
-                parameters.update(**SimDB.parse_input_file(os.path.join(sim_folder, path)))
+                parameters.update(**SimDB.parse_input_file(path))
         # Check if a simulation with these parameters exists
         search = self.db.search(Query().fragment(parameters))
         if len(search) == 0:
@@ -443,8 +497,8 @@ class ECModel(SynchedEntry):
         "Ne_0",             # Initial number of electrons
     }
 
-    def __init__(self, db: TinyDB, doc: int | Document):
-        result = doc if isinstance(doc, Document) else db.get(doc_id=doc)
+    def __init__(self, db: TinyDB | SimDB, doc: int | Document):
+        result = doc if isinstance(doc, Document) else (db if isinstance(db, TinyDB) else db.db).get(doc_id=doc)
         if result is None: raise KeyError("The provided doc_id={} does not exist in the database!".format(doc))
         # Populate this object with information from the database entry
         for k, v in result.items():
@@ -453,12 +507,12 @@ class ECModel(SynchedEntry):
             else:
                 setattr(self, "_"+k, v)
             self.set_sync(k)
-        super().__init__(db, result.doc_id, ECModel.PROPERTIES)
+        super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, ECModel.PROPERTIES)
 
     @property
     def data(self):
         if not hasattr("self", "_data"):
-            self._data = scipy.io.loadmat(os.path.join(self.path, FILENAMES["data"]))
+            self._data = scipy.io.loadmat(os.path.join(self.path, DBFolder.FILENAMES["data"]))
         return self._data
 
     @property
@@ -555,6 +609,95 @@ class ECModel(SynchedEntry):
         before the start of the first bunch passage.
         """
         self.Ne_0 = self.N_electrons[np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]]
+
+class InstabilityModel(SynchedEntry):
+    """
+    An InstabilityModel corresponds to one PyHEADTAIL instability simulation.
+    """
+    PROPERTIES = {
+        "data_files",       # Map of data contained in .h5 files: {filename: {propA: n.entries, propB: {subpropA: n.entries}}}
+        "bunch_data_file",   # The data file where bunch evolution is stored
+        "slice_data_file"   # The data file where slice evolution is stored
+    }
+    BUNCH_EVOLUTION = "bunch_evolution"
+    SLICE_EVOLUTION = "slice_evolution"
+    _h5 = None
+
+    def __init__(self, db: TinyDB | SimDB, doc: int | Document):
+        if InstabilityModel._h5 is None:
+            InstabilityModel._h5 = __import__("h5py")
+        result = doc if isinstance(doc, Document) else (db if isinstance(db, TinyDB) else db.db).get(doc_id=doc)
+        if result is None: raise KeyError("The provided doc_id={} does not exist in the database!".format(doc))
+        # Populate this object with information from the database entry
+        for k, v in result.items():
+            if isinstance(v, list) and len(v) > 0 and not type(v[0]) == str:
+                setattr(self, "_"+k, np.array(v, dtype=type(v[0])))
+            else:
+                setattr(self, "_"+k, v)
+            self.set_sync(k)
+        super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, InstabilityModel.PROPERTIES)
+
+    def _sync_get(self, attr: str):
+        if not hasattr(self, "_"+attr):
+            if hasattr(self, "gen_"+attr):
+                # Call the attribute's generator
+                getattr(self, "gen_"+attr)()
+            else:
+                raise ValueError("Requested synced property {} for which no generator is defined!".format(attr))
+        return super()._sync_get(attr)
+    
+    def gen_data_files(self):
+        """
+        Data files are the .hdf5 files produced by instability simulations.
+        """
+        self.data_files = {}
+        for path in [os.path.join(self.path, f) for f in os.listdir(self.path) if f.endswith(".h5")]:
+            with self._h5.File(path, "r") as f:
+                self.data_files[path] = {}
+                for k in f.keys():
+                    if isinstance(f[k], self._h5.Group):
+                        self.data_files[path][k] = {kk: len(f[k][kk]) for kk in f[k].keys()}
+                    else:
+                        self.data_files[path][k] = len(f[k])
+
+    def gen_bunch_data_file(self):
+        """
+        The bunch data file is the primary instability output.
+        """
+        self.bunch_data_file = None
+        for path in self.data_files:
+            if os.path.basename(path).lower().find(self.BUNCH_EVOLUTION) > -1:
+                self.bunch_data_file = path
+
+    def gen_slice_data_file(self):
+        """
+        The slice data file is the primary instability output.
+        """
+        self.slice_data_file = None
+        for path in self.data_files:
+            if os.path.basename(path).lower().find(self.SLICE_EVOLUTION) > -1:
+                self.slice_data_file = path
+
+    def get_data(self, prop: str, filename: str | None = None, group: str | None = None) -> np.ndarray:
+        """
+        Read data from a data file.
+        If the HDF5 file contains more than one group, it can be specified.
+        """
+        if filename is None:
+            if self.bunch_data_file is None:
+                raise ValueError("Specify bunch_data_file before calling get_data with one argument.")
+            filename = self.bunch_data_file
+        if not filename in self.data_files:
+            for path in self.data_files.keys():
+                if os.path.basename(path) == os.path.basename(str(filename)):
+                    filename = path
+                    break
+        with self._h5.File(filename, "r") as f:
+            if group is None:
+                if prop in self.data_files[filename]:
+                    return f.get(prop)[:]
+                return f[tuple(self.data_files[filename].keys())[0]].get(prop)[:]
+            return f[group].get(prop)[:]
 
 class DataSelector(object):
     """
