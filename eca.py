@@ -155,7 +155,7 @@ class TemplateSim(object):
         return path
 
     @staticmethod
-    def generate_sweep(parameters: Iterable, sweep: Iterable) -> list[dict]:
+    def generate_sweep(parameters: Iterable, sweep: Iterable, **constant) -> list[dict]:
         """
         Generate one set of changes for every combination of values for all parameters to be swept.
         Each parameter should correspond to one entry in sweep.
@@ -168,9 +168,9 @@ class TemplateSim(object):
 
         configurations = []
         for _ in range(np.prod(np.array(lengths))):
-            configurations.append({
+            configurations.append({**constant, **{
                 parameters[c]: sweep[c][counters[c]] for c in range(counters.size)
-            })
+            }})
             
             j = len(counters) - 1
             counters[j] += 1
@@ -202,7 +202,7 @@ class SimDB(object):
             if verbose: print("Found {} simulations to add to {}.".format(len(to_add), db_file))
             for i, entry in enumerate(to_add):
                 if verbose: print("{:<3}/{}".format(i, len(to_add)), end="\r")
-                self._add_single(*entry)
+                self._add_single(verbose, *entry)
             if verbose: print("Done.      ")
             if isinstance(self.db.storage, CachingMiddleware):
                 self.db.storage.flush()
@@ -232,7 +232,7 @@ class SimDB(object):
             return bool(value)
         return value
 
-    def _add_single(self, sim_folder: str, db_folder: DBFolder) -> bool:
+    def _add_single(self, verbose: bool, sim_folder: str, db_folder: DBFolder) -> bool:
         """
         Add a single simulation to the database.
         Returns True if it was added, and False
@@ -251,6 +251,11 @@ class SimDB(object):
             parameters["path"] = sim_folder
             self.db.insert(parameters)
             return True
+        elif verbose:
+            print("Duplicate of {} found at {}".format(sim_folder, search[0]["path"]))
+            for p, v in parameters.items():
+                print(p, v, search[0][p])
+            raise ValueError()
         return False
 
     def where(self, **search) -> list:
@@ -494,7 +499,9 @@ class ECModel(SynchedEntry):
         "cutoff",           # Index into data arrays corresponding to the last bunch passage
         "half_bunch",       # True (cut-off) half-width of bunch
         "magnet",           # The type of magnetic section (0: drift, 2: dipole, 4: quadrupole, 6: sextupole)
+        "mean_intensity",   # The mean beam intensity
         "Ne_0",             # Initial number of electrons
+        "perimeter"         # The perimeter of the beam chamber
     }
 
     def __init__(self, db: TinyDB | SimDB, doc: int | Document):
@@ -603,12 +610,38 @@ class ECModel(SynchedEntry):
             return
         self.magnet = 2 * len(self.B_multip)
 
+    def gen_mean_intensity(self):
+        """
+        The mean beam intensity.
+        """
+        start = np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]
+        self.mean_intensity = np.mean(self.intensity[start:start+self.time_to_index(self.b_spac)])
+
     def gen_Ne_0(self):
         """
         The initial amount of electrons - note that we do not use N_electrons[0] - instead, we take the amount at the point
         before the start of the first bunch passage.
         """
         self.Ne_0 = self.N_electrons[np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]]
+    
+    def gen_perimeter(self):
+        """
+        The length of the perimeter of the beam chamber.
+        """
+        chamber_path = os.path.join(self.path, self.filename_chm)
+        if not os.path.exists(chamber_path):
+            raise IOError("There is not a chamber definition at: {}".format(chamber_path))
+        chamber_data = scipy.io.loadmat(chamber_path)
+        Vx, Vy = chamber_data["Vx"].ravel(), chamber_data["Vy"].ravel()
+        Vx, Vy = Vx - np.mean(Vx), Vy - np.mean(Vy)
+        angle = np.atan2(Vy, Vx)
+        angle[angle < 0] += 2*np.pi
+        order = np.argsort(angle)
+        Vx, Vy = Vx[order], Vy[order]
+        Vx, Vy = np.append(Vx, Vx[0]), np.append(Vy, Vy[0])
+        self.perimeter = np.sum(
+            np.sqrt(np.diff(Vx)**2 + np.diff(Vy)**2)
+        )
 
 class InstabilityModel(SynchedEntry):
     """
@@ -899,11 +932,6 @@ class FurmanNoPhotoFit(Fit):
         )
 
     def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
-        # Ensure that we have a mean intensity (will only regenerate if missing)
-        model.ensure(
-            "mean_intensity", 
-            lambda : np.mean(model.intensity[model.time_to_index(model.t_offs):model.time_to_index(model.t_offs+model.b_spac)])
-        )
         scale_x = np.reciprocal(model.b_spac)
         scale_y = np.reciprocal(model.mean_intensity)
         self._mset("scale_x", scale_x, model)
@@ -957,11 +985,6 @@ class FurmanPhotoFit(Fit):
         )
 
     def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
-        # Ensure that we have a mean intensity (will only regenerate if missing)
-        model.ensure(
-            "mean_intensity", 
-            lambda : np.mean(model.intensity[model.time_to_index(model.t_offs):model.time_to_index(model.t_offs+model.b_spac)])
-        )
         scale_x = np.reciprocal(model.b_spac)
         scale_y = np.reciprocal(model.mean_intensity)
         self._mset("scale_x", scale_x, model)
@@ -981,7 +1004,7 @@ class FurmanPhotoFit(Fit):
             }
             self.initial({
                 "yc": model.N_electrons[model.cutoff]*scale_y,
-                "alpha": 0,
+                "alpha": model.k_pe_st*scipy.constants.c*model.b_spac,
                 "beta": min(1, abs(4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)))
             })
             self.bound(bounds)

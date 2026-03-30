@@ -7,7 +7,6 @@ For use with PyECLOUD.
 """
 
 import os, stat
-from eca import FILENAMES
 from subprocess import run as sp_run
 from datetime import datetime
 
@@ -16,13 +15,10 @@ class RunTarget(object):
     A RunTarget is an abstract representation of a destination for running simulations.
     """
     def __init__(self, job_folders: list[str]):
-        self.job_folders = list(sorted([os.path.abspath(f) for f in job_folders if os.path.exists(f)]))
+        self.job_folders = list(sorted([os.path.abspath(os.path.normpath(f)) for f in job_folders if os.path.exists(f)]))
 
     def __len__(self) -> int:
         return len(self.job_folders)
-
-    def check_finished(self) -> list[str]:
-        return [f for f in self.job_folders if os.path.exists(os.path.join(f, FILENAMES["data"]))]
 
     def submit(self):
         pass
@@ -35,10 +31,10 @@ class RunLocal(RunTarget):
         - ecloud: the root directory of PyECLOUD
     """
     TEMPLATE = """#!/bin/bash
-    cd {folder}
-    export ECLOUD={ecloud}
-    export PYTHONPATH=$ECLOUD:$ECLOUD/PyHEADTAIL:$ECLOUD/NAFFlib:$PYTHONPATH
-    {python} {ecloud_main}
+cd {folder}
+export ECLOUD={ecloud}
+export PYTHONPATH=$ECLOUD:$ECLOUD/PyHEADTAIL:$ECLOUD/NAFFlib:$PYTHONPATH
+{python} {ecloud_main}
     """
 
     def __init__(self, job_folders: list[str], python: str = "python", ecloud: str = "./"):
@@ -50,7 +46,7 @@ class RunLocal(RunTarget):
         """Create a shell script to run PyECLOUD"""
         output = os.path.join(os.path.abspath(folder), "run.sh") if output is None else output
         with open(output, "w") as f:
-            f.write(RunLocal.TEMPLATE.format(
+            f.write(self.TEMPLATE.format(
                 folder=folder,
                 python=self.python,
                 ecloud=self.ecloud,
@@ -236,3 +232,39 @@ queue dirname from {folder_listfile}"""
         # Make sure we also copy over the additional files
         self.include_files = [folder_listfile, sub_file]
         return submit_script
+
+class RunCondorContainer(RunCondor):
+    TEMPLATE = """#!/usr/bin/env bash
+cd {folder}
+CONTAINER_FULLPATH="{container_path}"
+echo $CONTAINER_FULLPATH
+# Optional: Print node info
+echo "************************ NODE INFO *************************" 
+hostname -A
+hostname -I
+lscpu
+echo "*********************** END NODE INFO ***********************"
+# Important: Print container version for future reference
+echo "********************** CONTAINER INFO **********************"
+apptainer exec --home "$_CONDOR_SCRATCH_DIR" --cleanenv $CONTAINER_FULLPATH bash -lc 'echo $ECLOUD_CONTAINER_VERSION'
+echo "******************** END CONTAINER INFO ********************"
+apptainer exec --env PYTHONNOUSERSITE=1 --home "$_CONDOR_SCRATCH_DIR" --writable-tmpfs --cleanenv $CONTAINER_FULLPATH python /home/eclouduser/PyCOMPLETE/PyECLOUD/main.py
+    """
+
+    def __init__(self, job_folders: list[str], container_path: str = "/cvmfs/unpacked.cern.ch/ghcr.io/ekatralis/ecloud-containers:latest",
+                submission_name: str | None = None, remote_folder: str | None = None, username: str | None = None, hostname: str = "lxplus.cern.ch"):
+        self.container_path = container_path
+        super().__init__(job_folders, "", "", submission_name, remote_folder, username, hostname)
+
+    def make_script(self, folder: str, output: None | str = None) -> str:
+        """Create a shell script to run PyECLOUD"""
+        output = os.path.join(os.path.abspath(folder), "run.sh") if output is None else output
+        with open(output, "w") as f:
+            f.write(self.TEMPLATE.format(
+                folder=folder,
+                container_path=self.container_path
+            ))
+        s = os.stat(output)
+        os.chmod(output, s.st_mode | stat.S_IEXEC)
+        return output
+        
