@@ -5,8 +5,8 @@ EcA - Electron Cloud Analysis v1
 
 For use with PyECLOUD.
 """
-from os.path import isfile
 from typing import Callable, Iterable
+from functools import partial as functools_partial
 
 import numpy as np
 import scipy
@@ -227,7 +227,7 @@ class SimDB(object):
         if isinstance(value, np.number):
             # Cannot serialize numpy numbers, so check and make it float or int
             return int(value) if isinstance(value, np.integer) else (complex(value) if np.iscomplex(value) else float(value))
-        if isinstance(value, np.bool):
+        if isinstance(value, (bool, np.bool_)):
             # The numpy bool type is also not supported
             return bool(value)
         return value
@@ -413,9 +413,12 @@ class SynchedEntry(object):
     propagated to the database.
     """
     def __init__(self, db: TinyDB, doc_id: int, synch: Iterable[str] = []):
-        self.db = db
-        self.id = doc_id
-        self.attached = True
+        # 1. Initialize core attributes using super() to bypass custom __setattr__
+        super().__setattr__("db", db)
+        super().__setattr__("id", doc_id)
+        super().__setattr__("attached", True)
+        super().__setattr__("_changes", {})
+        super().__setattr__("_synced_attrs", set())
         for attr in synch:
             self.set_sync(attr)
     
@@ -429,21 +432,29 @@ class SynchedEntry(object):
         """Reattach this object to the database, synchronizing the accumulated state."""
         if not self.attached:
             self.attached = True
-            self.db.update({k: SimDB.prepare(v) for k, v in self._changes.items() if not (getattr(self, "_"+k))}, doc_ids=[self.id])
+            self.db.update({
+                k: SimDB.prepare(v) for k, v in self._changes.items() 
+                if not hasattr(self, "_" + k)
+            }, doc_ids=[self.id])
+            self._changes.clear()
 
     def _sync_get(self, attr: str):
-        """Retrieve the property."""
-        return getattr(self, "_"+attr)
+        """Retrieve the property. Overridden by child classes (like ECModel) to generate if missing."""
+        try:
+            return getattr(self, "_" + attr)
+        except AttributeError:
+            raise AttributeError(f"'{self.__class__.__name__}' has no synced attribute '{attr}'")
 
     def _sync_set(self, attr: str, value):
         """Set the property, and update its value in the database."""
-        if hasattr(self, "_"+attr):
+        if hasattr(self, "_" + attr):
+            current_val = getattr(self, "_" + attr)
             if isinstance(value, np.ndarray):
-                if getattr(self, "_"+attr).shape == value.shape and np.all(getattr(self, "_"+attr) == value):
+                if isinstance(current_val, np.ndarray) and current_val.shape == value.shape and np.all(current_val == value):
                     return
-            elif getattr(self, "_"+attr) == value:
+            elif current_val == value:
                 return
-        setattr(self, "_"+attr, value)
+        super().__setattr__("_" + attr, value)
         if self.attached:
             self.db.update({attr: SimDB.prepare(value)}, doc_ids=[self.id])
         else:
@@ -451,31 +462,46 @@ class SynchedEntry(object):
 
     def _sync_delete(self, attr: str):
         """Delete the property and its corresponding value in the database."""
-        delattr(self, "_"+attr)
+        if hasattr(self, "_" + attr):
+            super().__delattr__("_" + attr)
         if self.attached:
             result = self.db.get(doc_id=self.id)
             if not result is None:
                 self.db.update({k: v for k, v in result.items() if k != attr}, doc_ids=[self.id])
         else:
-            del self._changes[attr]
+            self._changes.pop(attr, None)
 
     def set_sync(self, attr: str):
-        """Mark a property to be synced, attaching its getter, setter, and deleter."""
-        if not hasattr(type(self), attr):
-            setattr(type(self), attr, property(
-                lambda s: s._sync_get(attr),
-                lambda s, v: s._sync_set(attr, v),
-                lambda s: s._sync_delete(attr),
-                "DB Synched property {}".format(attr)
-                ))
+        """Register an attribute to be intercepted and synced."""
+        self._synced_attrs.add(attr)
 
     def ensure(self, attr: str, gen: Callable) -> bool:
-        """Ensure that the attribute exists and is synced, calling gen() to make it if it does not, returning True if generated."""
+        """Ensure that the attribute exists and is synced, calling gen() to make it if it does not."""
         self.set_sync(attr)
-        if not hasattr(self, "_"+attr):
+        if not hasattr(self, "_" + attr):
             self._sync_set(attr, gen())
             return True
         return False
+
+    def __getattr__(self, name: str):
+        """Intercepts attribute access only if the attribute is NOT found normally."""
+        if "_synced_attrs" in self.__dict__ and name in self._synced_attrs:
+            return self._sync_get(name)
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+
+    def __setattr__(self, name: str, value):
+        """Intercepts ALL attribute assignments."""
+        if "_synced_attrs" in self.__dict__ and name in self._synced_attrs:
+            self._sync_set(name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name: str):
+        """Intercepts ALL attribute deletions."""
+        if "_synced_attrs" in self.__dict__ and name in self._synced_attrs:
+            self._sync_delete(name)
+        else:
+            super().__delattr__(name)
 
 def smooth(array: np.ndarray, window: int | np.integer) -> np.ndarray:
     """Smooths a NumPy array using convolution, preserving the initial value."""
@@ -507,6 +533,7 @@ class ECModel(SynchedEntry):
     def __init__(self, db: TinyDB | SimDB, doc: int | Document):
         result = doc if isinstance(doc, Document) else (db if isinstance(db, TinyDB) else db.db).get(doc_id=doc)
         if result is None: raise KeyError("The provided doc_id={} does not exist in the database!".format(doc))
+        super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, ECModel.PROPERTIES)
         # Populate this object with information from the database entry
         for k, v in result.items():
             if isinstance(v, list) and len(v) > 0 and not type(v[0]) == str:
@@ -514,7 +541,6 @@ class ECModel(SynchedEntry):
             else:
                 setattr(self, "_"+k, v)
             self.set_sync(k)
-        super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, ECModel.PROPERTIES)
 
     @property
     def data(self):
@@ -661,6 +687,7 @@ class InstabilityModel(SynchedEntry):
             InstabilityModel._h5 = __import__("h5py")
         result = doc if isinstance(doc, Document) else (db if isinstance(db, TinyDB) else db.db).get(doc_id=doc)
         if result is None: raise KeyError("The provided doc_id={} does not exist in the database!".format(doc))
+        super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, InstabilityModel.PROPERTIES)
         # Populate this object with information from the database entry
         for k, v in result.items():
             if isinstance(v, list) and len(v) > 0 and not type(v[0]) == str:
@@ -668,7 +695,6 @@ class InstabilityModel(SynchedEntry):
             else:
                 setattr(self, "_"+k, v)
             self.set_sync(k)
-        super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, InstabilityModel.PROPERTIES)
 
     def _sync_get(self, attr: str):
         if not hasattr(self, "_"+attr):
@@ -771,6 +797,7 @@ class Fit(object):
         self.variables = tuple(variables)
         self.selector = selector
         self._reset_state()
+        self._compiled_fn = compile(self.function, f"<{self.name}_fitfn>", "eval")
 
     def _reset_state(self):
         self.initial_guess = np.ones(shape=(len(self.variables)-1,))
@@ -809,15 +836,33 @@ class Fit(object):
         model.set_sync(self.name+"_"+attr)
         model._sync_set(self.name+"_"+attr, value)
 
+    def _evaluate(self, code, names, f_mask, f_vals, x, *free_params):
+        """
+        Internal bridge that maps Scipy's (x, *free_params) call 
+        to the full set of variables required by the expression.
+        """
+        eval_context = {"np": np, "scipy": scipy, names[0]: x}
+        # Reconstruct the full parameter list from free and fixed values
+        free_ptr = 0
+        for i, name in enumerate(names[1:]):
+            if f_mask[i]:
+                eval_context[name] = f_vals[i]
+            else:
+                eval_context[name] = free_params[free_ptr]
+                free_ptr += 1
+        # Use a restricted eval on the pre-compiled code object
+        return eval(code, {"__builtins__": {}}, eval_context)
+
     def _make_target(self):
-        context = {self.variables[i+1]: self.fixed_values[i] for i in range(len(self.initial_guess)) if self.fixed[i]}
-        exec("target = lambda {}, {} : ({})".format(
-                self.variables[0],
-                ", ".join(v for i, v in enumerate(self.variables[1:]) if not self.fixed[i]),
-                self.function),
-            globals={"np": np, "scipy": scipy, **context}, locals=context)
-        target = context["target"]
-        return target
+        fixed_mask = self.fixed.copy()
+        fixed_vals = self.fixed_values.copy()
+        return functools_partial(
+            self._evaluate, 
+            self._compiled_fn, 
+            self.variables, 
+            fixed_mask, 
+            fixed_vals
+        )
 
     @property
     def full_names(self):
@@ -1040,15 +1085,9 @@ if __name__ == "__main__":
         print("\n - " + "\n - ".join(db.all_keys()))
     else:
         if argv[2] == "interactive":
-            code = "print(\"Interactive Python prompt, db is loaded\")"
+            import code
             v = {"db": SimDB(argv[1]), "ECModel": ECModel, "np": np, "scipy": scipy}
-            while code != "exit()":
-                if "=" in code:
-                    exec(code, v)
-                else:
-                    result = eval(code, v)
-                    if not result is None: print("-> {}".format(result))
-                code = input ("> ")
+            code.interact(local=v, banner="Interactive Python prompt. 'db' is loaded.")
         else:
             db_filename = argv[1]
             db_finfo = argv[2:]
