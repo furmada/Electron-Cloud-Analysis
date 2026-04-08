@@ -275,14 +275,17 @@ class SimDB(object):
         non_dynamic = {}
         dynamic = {}
         for k, v in search.items():
-            if k.startswith("_") and type(v) == str:
-                comp = compile(v, "query_expr", "eval")
-                context = {"np": np, "scipy": scipy, "ECModel": ECModel, "db": self}
-                dynamic[k] = lambda r: eval(comp, context, {rk: rv for rk, rv in r.items()})
-            elif isinstance(v, Callable):
-                dynamic[k] = v
-            elif isinstance(v, np.ndarray):
-                non_dynamic[k] = v.tolist()
+            if k.startswith("_"):
+                if type(v) == str:
+                    comp = compile(v, "query_expr", "eval")
+                    context = {"np": np, "scipy": scipy, "ECModel": ECModel, "db": self}
+                    dynamic[k] = lambda r: eval(comp, context, {rk: rv for rk, rv in r.items()})
+                elif isinstance(v, Callable):
+                    dynamic[k] = v
+                elif isinstance(v, np.ndarray):
+                    non_dynamic[k] = v.tolist()
+            elif isinstance(v, WhereIn):
+                dynamic[k] = v.query
             else:
                 non_dynamic[k] = v
         results = self.db.search(Query().fragment(non_dynamic))
@@ -303,6 +306,16 @@ class SimDB(object):
                     filtered_results.append(result)
             return filtered_results
         return results
+
+    def complementary(self, **search) -> dict:
+        """
+        Returns the query that will select all entries in the DB *not* selected by search.
+        So, where(complementary(where(A == 1))) returns all entries where A != 1.
+        """
+        result_ids = set([r["doc_id"] for r in self.where(**search)])
+        all_ids = [doc.doc_id for doc in self.db.all()]
+        complement_ids = [i for i in all_ids if not i in result_ids]
+        return {"doc_id": WhereIn(*complement_ids, str_match=False)}
 
     def by(self, attr: str, **search) -> list:
         """
@@ -402,6 +415,36 @@ class SimDB(object):
             for k in result.keys():
                 keys.add(k)
         return list(sorted(keys))
+
+# In eca.py, replace the WhereIn class with this improved version:
+
+class WhereIn(object):
+    """
+    Addon to db.where functionality enabling matching to any one of a set of items.
+    Now handles type coercion for better matching across different numeric types.
+    """
+    def __init__(self, *items, str_match=True):
+        self.match = [tuple(i) if isinstance(i, list) or isinstance(i, np.ndarray) else i for i in items]
+        if str_match:
+            self.match_str = {str(item) for item in items}
+    
+    def query(self, value, _):
+        # First try exact match
+        if value in self.match:
+            return True
+        # Try numeric equivalence (handles int vs float vs numpy types)
+        try:
+            if isinstance(value, (int, float, np.number)):
+                for match_val in self.match:
+                    if isinstance(match_val, (int, float, np.number)):
+                        if float(value) == float(match_val):
+                            return True
+        except (ValueError, TypeError):
+            pass
+        # Try string representation match
+        if hasattr(self, "match_str") and str(value) in self.match_str:
+            return True
+        return False
 
 
 class SynchedEntry(object):
@@ -519,6 +562,7 @@ class ECModel(SynchedEntry):
     An ECModel corresponds to the analysis of one PyECloud data file.
     """
     PROPERTIES = {
+        "area",             # The area of the beam chamber
         "buildup",          # True if there is multipacting buildup of EC
         "bunch_step",       # The number of indexes corresponding to b_spac
         "bunch_times",      # Times of each bunch maximum (t_off + n * b_spac)
@@ -536,11 +580,11 @@ class ECModel(SynchedEntry):
         super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, ECModel.PROPERTIES)
         # Populate this object with information from the database entry
         for k, v in result.items():
+            self.set_sync(k)
             if isinstance(v, list) and len(v) > 0 and not type(v[0]) == str:
                 setattr(self, "_"+k, np.array(v, dtype=type(v[0])))
             else:
                 setattr(self, "_"+k, v)
-            self.set_sync(k)
 
     @property
     def data(self):
@@ -555,6 +599,10 @@ class ECModel(SynchedEntry):
     @property
     def N_electrons(self):
         return self.data["Nel_timep"].ravel()
+
+    @property
+    def central_density(self):
+        return self.data["cen_density"].ravel()
 
     @property
     def N_sec(self):
@@ -596,6 +644,12 @@ class ECModel(SynchedEntry):
         Convert time(s) to corresponding index(es) in the time array (floor-wise).
         """
         return np.floor(t / (self.time[1] - self.time[0])).astype(int)
+
+    def gen_area(self):
+        """
+        Calculates the area of the beam chamber.
+        """
+        self.gen_perimeter()
 
     def gen_buildup(self):
         """
@@ -668,6 +722,9 @@ class ECModel(SynchedEntry):
         self.perimeter = np.sum(
             np.sqrt(np.diff(Vx)**2 + np.diff(Vy)**2)
         )
+        self.area = 0.5 * np.abs(
+            np.sum(Vx[:-1] * Vy[1:] - Vx[1:] * Vy[:-1])
+        )
 
 class InstabilityModel(SynchedEntry):
     """
@@ -690,11 +747,11 @@ class InstabilityModel(SynchedEntry):
         super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, InstabilityModel.PROPERTIES)
         # Populate this object with information from the database entry
         for k, v in result.items():
+            self.set_sync(k)
             if isinstance(v, list) and len(v) > 0 and not type(v[0]) == str:
                 setattr(self, "_"+k, np.array(v, dtype=type(v[0])))
             else:
                 setattr(self, "_"+k, v)
-            self.set_sync(k)
 
     def _sync_get(self, attr: str):
         if not hasattr(self, "_"+attr):
@@ -785,6 +842,19 @@ class BunchAverageSelector(DataSelector):
         averages = np.zeros_like(pre_bp)
         for b, start in enumerate(pre_bp):
             averages[b] = np.mean(model.N_electrons[start:start+model.bunch_step])
+        return ((model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid], averages)
+
+class CentralDensityAverageSelector(DataSelector):
+    """
+    Selects the points immediately before each bunch passage as the fitting points.
+    """
+    def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
+        pre_bp = np.array(model.time_to_index(model.bunch_times - model.half_bunch))
+        valid = pre_bp < model.time.size
+        pre_bp = pre_bp[valid]
+        averages = np.zeros_like(pre_bp)
+        for b, start in enumerate(pre_bp):
+            averages[b] = np.mean(model.central_density[start:start+model.bunch_step]) * model.area
         return ((model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid], averages)
 
 class Fit(object):
