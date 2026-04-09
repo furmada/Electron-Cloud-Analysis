@@ -64,11 +64,11 @@ class ECAApp:
                 return str(val)
                 
             # Scientific notation for magnitudes >= 1000
-            if abs(val) >= 1000:
+            if abs(val) >= 1000 or abs(val) < 1e-4:
                 return f"{val:.3E}"
             # 3 decimal places for floats < 1000
             elif isinstance(val, (float, np.floating)):
-                return f"{val:.5f}"
+                return f"{val:.4f}"
             else:
                 return str(val) # Keep standard integers as standard integers
                 
@@ -258,10 +258,13 @@ class ECAApp:
         simulations = self.db.where()
         total_count = len(simulations)
         
-        # Populate simulation list
+        # Populate simulation list with missing path detection
         for sim in simulations:
             path = sim.get('path', 'Unknown')
-            self.sim_tree.insert("", tk.END, values=(path,))
+            display_path = path
+            if not os.path.exists(path):
+                display_path = "(Path not found) " + display_path
+            self.sim_tree.insert("", tk.END, values=(display_path,))
             
         # Calculate property statistics
         all_keys = self.db.all_keys()
@@ -285,11 +288,9 @@ class ECAApp:
         for prop, stats in sorted(property_stats.items()):
             self.prop_text.insert(tk.END, f"{prop}: {stats['unique_count']} unique values\n")
             if stats['unique_count'] < 100:
-                # Format all values
                 formatted_vals = [self._format_value(v) for v in stats['values']]
                 self.prop_text.insert(tk.END, f"  Values: {', '.join(formatted_vals)}\n")
             else:
-                # Format sample values
                 formatted_vals = [self._format_value(v) for v in stats['values'][:10]]
                 self.prop_text.insert(tk.END, f"  Sample: {', '.join(formatted_vals)}\n")
             self.prop_text.insert(tk.END, "\n")
@@ -832,8 +833,8 @@ class ECAApp:
         tab.columnconfigure(1, weight=1)
         tab.rowconfigure(0, weight=1)
         
-        # Fit selection
-        fit_frame = ttk.LabelFrame(right_frame, text="Fit Model", padding="5")
+        # Fit selection & UI controls
+        fit_frame = ttk.LabelFrame(right_frame, text="Plot Configuration", padding="5")
         fit_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         
         self.individual_fit_var = tk.StringVar(value="None")
@@ -841,6 +842,16 @@ class ECAApp:
         self.individual_fit_combo = ttk.Combobox(fit_frame, textvariable=self.individual_fit_var, state="readonly", width=20)
         self.individual_fit_combo['values'] = ["None", "FurmanNoPhoto", "FurmanPhoto"]
         self.individual_fit_combo.pack(side=tk.LEFT, padx=5)
+        
+        # --- NEW UI CONTROLS ---
+        self.individual_central_density_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fit_frame, text="Use Central Density", variable=self.individual_central_density_var).pack(side=tk.LEFT, padx=10)
+
+        ttk.Label(fit_frame, text="Max X:").pack(side=tk.LEFT)
+        self.individual_max_x_var = tk.StringVar()
+        self.individual_max_x_entry = ttk.Entry(fit_frame, textvariable=self.individual_max_x_var, width=8)
+        self.individual_max_x_entry.pack(side=tk.LEFT, padx=2)
+        # -----------------------
         
         # Optional Plot Button
         plot_btn = ttk.Button(fit_frame, text="Replot (Apply Changes)", command=self._plot_individual_simulation)
@@ -905,51 +916,93 @@ class ECAApp:
             self.individual_sim_tree.insert("", tk.END, values=values)
             
     def _plot_individual_simulation(self):
-        """Plot a single simulation. Auto-triggers on tree selection."""
-        selection = self.individual_sim_tree.selection()
-        if not selection:
+        """Plot selected simulation(s). Auto-triggers on tree selection and allows multi-select."""
+        selections = self.individual_sim_tree.selection()
+        if not selections:
             return
             
         db_to_use = self.filtered_db if self.filtered_db else self.db
         if not db_to_use:
             return
             
-        sim_item = self.individual_sim_tree.item(selection[0])
-        try:
-            doc_id_idx = self.individual_columns.index("doc_id")
-            doc_id = int(sim_item['values'][doc_id_idx])
-        except (ValueError, IndexError):
-            messagebox.showerror("Error", "Could not locate a valid document ID.")
-            return
-            
-        try:
-            # Create ECModel using doc_id (fast)
-            model = ECModel(db_to_use.db, doc_id)
-            
-            # Clear previous plot
-            self.individual_fig.clear()
-            ax = self.individual_fig.add_subplot(111)
-            
-            # Get fit model if selected
-            fit_model = self.individual_fit_var.get()
-            fits = []
-            if fit_model != "None":
-                if fit_model == "FurmanNoPhoto":
-                    fits.append(FurmanNoPhotoFit())
-                elif fit_model == "FurmanPhoto":
-                    fits.append(FurmanPhotoFit())
-            
-            # Plot using your provided ecaplots function
-            model_plot(model, fits, size=ax)
-            
+        # Clear previous plot
+        self.individual_fig.clear()
+        ax = self.individual_fig.add_subplot(111)
+        
+        # Get fit model if selected
+        fit_model_name = self.individual_fit_var.get()
+        fit_classes = []
+        if fit_model_name != "None":
+            if fit_model_name == "FurmanNoPhoto":
+                fit_classes.append(FurmanNoPhotoFit)
+            elif fit_model_name == "FurmanPhoto":
+                fit_classes.append(FurmanPhotoFit)
+                
+        plotted_count = 0
+        
+        for idx, selection in enumerate(selections):
+            sim_item = self.individual_sim_tree.item(selection)
+            try:
+                doc_id_idx = self.individual_columns.index("doc_id")
+                doc_id = int(sim_item['values'][doc_id_idx])
+            except (ValueError, IndexError):
+                continue
+                
+            try:
+                # Initialize model without executing data reads
+                model = ECModel(db_to_use.db, doc_id)
+                path_exists = os.path.exists(model.path) and os.path.exists(os.path.join(model.path, "Pyecltest.mat"))
+                
+                fits_to_plot = [FitClass() for FitClass in fit_classes]
+
+                # If there's no data and no fits selected, we skip entirely
+                if not path_exists and not fits_to_plot:
+                    continue
+                
+                # Determine central density flag based on UI toggle and data availability
+                cd_param = self.individual_central_density_var.get() if path_exists else None
+                
+                # Read Max X override, calculate default if empty
+                max_x_str = self.individual_max_x_var.get().strip()
+                if not max_x_str:
+                    try:
+                        fit_max_x = (model.cutoff / model.bunch_step) * 1.25
+                        # Display the default if only one simulation is selected
+                        if len(selections) == 1:
+                            self.individual_max_x_var.set(f"{fit_max_x:.1f}")
+                    except Exception:
+                        fit_max_x = 300.0
+                else:
+                    try:
+                        fit_max_x = float(max_x_str)
+                    except ValueError:
+                        fit_max_x = 300.0
+                
+                # Guard rails for plotting empty paths
+                if not path_exists and fit_max_x <= 0:
+                     fit_max_x = 300.0
+                
+                # Hook into new functionality inside ecaplots
+                model_plot(
+                    model=model,
+                    fits=fits_to_plot,
+                    size=ax,
+                    show_error=True,
+                    central_density=cd_param,
+                    fit_maxX=fit_max_x
+                )
+                            
+                plotted_count += 1
+                
+            except Exception as e:
+                print(f"Plot failed for ID {doc_id}: {e}")
+                
+        if plotted_count > 0:
             self.individual_fig.tight_layout()
             self.individual_canvas.draw()
-            
-            self._update_status(f"Plotted simulation ID: {doc_id}")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Plot failed: {str(e)}")
-            self._update_status("Plot failed")
+            self._update_status(f"Plotted {plotted_count} simulation(s)")
+        else:
+            self._update_status("No valid data or fits to plot.")
             
     def _clear_individual_plot_tab(self):
         """Clear the individual plot tab."""

@@ -588,7 +588,7 @@ class ECModel(SynchedEntry):
 
     @property
     def data(self):
-        if not hasattr("self", "_data"):
+        if not hasattr(self, "_data"):
             self._data = scipy.io.loadmat(os.path.join(self.path, DBFolder.FILENAMES["data"]))
         return self._data
 
@@ -819,8 +819,11 @@ class DataSelector(object):
     """
     A DataSelector chooses data for fitting or other analysis from an ECModel.
     """
+    def __init__(self, use_central_density: bool = False):
+        self.use_central_density = use_central_density
+
     def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        return (model.time, model.N_electrons)
+        return (model.time, model.central_density if self.use_central_density else model.N_electrons)
 
 class BeforeBunchSelector(DataSelector):
     """
@@ -829,7 +832,8 @@ class BeforeBunchSelector(DataSelector):
     def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
         pre_bp = np.array(model.time_to_index(model.bunch_times - model.half_bunch))
         valid = pre_bp < model.time.size
-        return (model.time[pre_bp[valid]], model.N_electrons[pre_bp[valid]])
+        return (model.time[pre_bp[valid]],
+                (model.central_density if self.use_central_density else model.N_electrons)[pre_bp[valid]])
 
 class BunchAverageSelector(DataSelector):
     """
@@ -841,20 +845,8 @@ class BunchAverageSelector(DataSelector):
         pre_bp = pre_bp[valid]
         averages = np.zeros_like(pre_bp)
         for b, start in enumerate(pre_bp):
-            averages[b] = np.mean(model.N_electrons[start:start+model.bunch_step])
-        return ((model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid], averages)
-
-class CentralDensityAverageSelector(DataSelector):
-    """
-    Selects the points immediately before each bunch passage as the fitting points.
-    """
-    def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        pre_bp = np.array(model.time_to_index(model.bunch_times - model.half_bunch))
-        valid = pre_bp < model.time.size
-        pre_bp = pre_bp[valid]
-        averages = np.zeros_like(pre_bp)
-        for b, start in enumerate(pre_bp):
-            averages[b] = np.mean(model.central_density[start:start+model.bunch_step]) * model.area
+            averages[b] = np.mean(
+                (model.central_density if self.use_central_density else model.N_electrons)[start:start+model.bunch_step])
         return ((model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid], averages)
 
 class Fit(object):
@@ -900,7 +892,7 @@ class Fit(object):
             self.fixed_values[i - 1] = f
 
     def _mget(self, attr: str, model: ECModel, default: bool | float | int | np.number | np.ndarray = False):
-        return getattr(model, self.name+"_"+attr) if hasattr(model, "_"+self.name+"_"+attr) else default
+        return getattr(model, self.name+"_"+attr) if hasattr(model, "_"+self.name+"_"+attr) or hasattr(model, self.name+"_"+attr) else default
     
     def _mset(self, attr: str, value, model: ECModel):
         model.set_sync(self.name+"_"+attr)
@@ -990,7 +982,7 @@ class Fit(object):
                 self._mset("success", False, model)
                 setattr(model, "_"+self.name+"_fitting_error", e)
                 return None
-        self._reset_state()
+            self._reset_state()
         return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
 
     def fit_function(self, model: ECModel, params: np.ndarray | None = None) -> Callable[..., float | np.number | np.ndarray]:

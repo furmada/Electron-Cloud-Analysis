@@ -16,35 +16,55 @@ def _axes(size: tuple[int, int] | None | Axes) -> Axes:
         return plt.gca()
     return size
 
-def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None | Axes = (10, 5), log: tuple[bool, bool] = (False, False), show_error: bool = True, refit: bool = False):
+def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None | Axes = (10, 5),
+                 log: tuple[bool, bool] = (False, False), show_error: bool = True, refit: bool = False,
+                 central_density: bool | None = False, fit_maxX: float = -1.0):
     """
     Plot the raw data and each Fit if it succeeded.
     """
     ax = _axes(size)
     if len(list(fits)) == 0:
         step = model.time_to_index(model.t_offs)
-        ax.scatter((model.time[::step] - model.t_offs) / model.b_spac, model.N_electrons[::step], s=1, c="k", label="Data")
+        if not central_density is None:
+            if central_density:
+                B = (model.time[::step] - model.t_offs) / model.b_spac
+                F = model.central_density[::step]
+            else:
+                B = (model.time[::step] - model.t_offs) / model.b_spac
+                F = model.N_electrons[::step]
+            if fit_maxX > 0:
+                B, F = B[B <= fit_maxX], F[B <= fit_maxX]
+            ax.scatter(B, F, s=1, label="Data")
     else:
         for fit in fits:
             result = fit.fit(model, refit=refit)
-            T, F = fit.select_data(model)
+            if central_density is None:
+                T = np.arange(model.t_offs, fit_maxX * model.b_spac)
+                F = np.zeros_like(T)
+            else:
+                T, F = fit.select_data(model)
+            if fit_maxX > 0:
+                T, F = T[T <= fit_maxX * model.b_spac], F[T <= fit_maxX * model.b_spac]
+            Tsmooth = np.linspace(0, max(fit_maxX * model.b_spac, T[-1]), int(max(fit_maxX, T[-1] / model.b_spac))+1)          
             B = (T - model.t_offs) / model.b_spac
-            if not result is None:
-                ax.plot(B, fit.fit_function(model)(T), label="Fit: {}".format(fit.name))
+            Bsmooth = (Tsmooth - model.t_offs) / model.b_spac
+            if not (result is None):
+                ax.plot(Bsmooth, fit.fit_function(model)(Tsmooth), label="Fit: {}".format(fit.name))
                 if show_error:
                     ax.fill_between(
-                        B,
-                        fit.fit_function(model, result[0] - result[1])(T),
-                        fit.fit_function(model, result[0] + result[1])(T),
+                        Bsmooth,
+                        fit.fit_function(model, result[0] - result[1])(Tsmooth),
+                        fit.fit_function(model, result[0] + result[1])(Tsmooth),
                         alpha=0.2, label="Err: {}".format(fit.name))
             else:
                 print("Fitting failed: {}".format(getattr(model, "_"+fit.name+"_fitting_error")))
-            ax.scatter(B, F, s=1, c="k", label="Data: {}".format(fit.name))
+            if not (central_density is None):
+                ax.scatter(B, F, s=1, label="Data: {}".format(fit.name))
     if log[0]: ax.set_xscale("log")
     if log[1]: ax.set_yscale("log")
     if not size is None:
         ax.set_xlabel("Bunch Passage")
-        ax.set_ylabel("N. Electrons")
+        ax.set_ylabel("N. Electrons in Centre / m" if central_density == True else "N. Electrons / m")
         ax.set_title("SEY={:.2f}, I={:.2E}, B={}".format(model.del_max, model.fact_beam, model.B_multip))
         ax.legend()
 
