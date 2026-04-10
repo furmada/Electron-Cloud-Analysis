@@ -30,9 +30,12 @@ except ImportError as e:
 class ECAApp:
     """Main application class for the Electron Cloud Analysis GUI."""
     
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, db: Optional[SimDB] = None, is_temp: bool = False):
         self.root = root
-        self.root.title("ECA GUI - Electron Cloud Analysis")
+        self.is_temp = is_temp
+        
+        title_prefix = "[TEMP WINDOW] " if is_temp else ""
+        self.root.title(f"{title_prefix}ECA GUI - Electron Cloud Analysis")
         self.root.geometry("1400x900")
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         
@@ -40,19 +43,35 @@ class ECAApp:
         self._setup_fonts()
         
         # Application state
-        self.db: Optional[SimDB] = None
-        self.filtered_db: Optional[SimDB] = None
+        self.db: Optional[SimDB] = db
+        self.search_criteria: Dict[str, Any] = {}
         self.current_models: List[ECModel] = []
         self.selected_simulations: List[str] = []
         
         # Setup UI
         self._setup_ui()
+        
+        # If initialized with an existing DB (e.g. Temp Window), populate UI
+        if self.db:
+            self._update_overview_tab()
+            self._populate_filter_options()
+            self._populate_plot_options()
+            self._populate_individual_options()
+            self._update_individual_sim_list()
+            
+            label_text = "Loaded: Extracted Temp DB" if self.is_temp else "Loaded Database"
+            self.info_label.config(text=label_text)
+            self._update_status(f"Loaded {len(self.db.where())} simulations")
 
     def _on_closing(self):
-        """Ensure the process terminates fully."""
-        if messagebox.askokcancel("Quit", "Do you want to quit?"):
-            self.root.destroy()
-            sys.exit(0)
+        """Ensure the process terminates fully for main window, or just destroys temp window."""
+        window_type = "temporary " if self.is_temp else ""
+        if messagebox.askokcancel("Quit", f"Do you want to close this {window_type}window?"):
+            if self.is_temp:
+                self.root.destroy()
+            else:
+                self.root.destroy()
+                sys.exit(0)
 
     def _format_value(self, val: Any) -> str:
         """Format numbers consistently for display."""
@@ -132,10 +151,15 @@ class ECAApp:
         clear_btn = ttk.Button(toolbar, text="Clear Database", command=self._clear_database)
         clear_btn.pack(side=tk.LEFT, padx=2)
         
+        # Save Database Button (Only for Temp Windows)
+        if self.is_temp:
+            save_btn = ttk.Button(toolbar, text="Save Database As...", command=self._save_database)
+            save_btn.pack(side=tk.LEFT, padx=2)
+        
         # Spacer
         ttk.Label(toolbar, text="").pack(side=tk.LEFT, expand=True)
         
-        # Info label (updated dynamically now)
+        # Info label
         self.info_label = ttk.Label(toolbar, text="No database loaded", font=("TkDefaultFont", 11, "bold"))
         self.info_label.pack(side=tk.RIGHT, padx=5)
         
@@ -153,7 +177,7 @@ class ECAApp:
             try:
                 self.db = SimDB(filename, verbose=True)
                 
-                # --- NEW PATH HANDLING ---
+                # Path handling
                 simulations = self.db.where()
                 status_suffix = ""
                 if simulations:
@@ -162,9 +186,9 @@ class ECAApp:
                         db_dir = os.path.dirname(os.path.abspath(filename))
                         os.chdir(db_dir)
                         status_suffix = f" (CWD set to {db_dir})"
-                # -------------------------
                 
-                self.filtered_db = None
+                self.search_criteria = {}
+                self.active_filters = {}
                 self.current_models = []
                 self.selected_simulations = []
                 
@@ -183,11 +207,39 @@ class ECAApp:
                 messagebox.showerror("Error", f"Failed to load database: {str(e)}")
                 self._update_status("Error loading database")
                 
+    def _save_database(self):
+        """Save the in-memory/temp database to a physical JSON file."""
+        if not self.db:
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            title="Save Database As",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        
+        if filename:
+            try:
+                from tinydb import TinyDB
+                from tinydb.storages import JSONStorage
+                from tinydb.middlewares import CachingMiddleware
+                
+                # Create a fresh file and insert all documents
+                new_db = TinyDB(filename, storage=CachingMiddleware(JSONStorage))
+                new_db.insert_multiple(self.db.db.all())
+                new_db.close()
+                
+                messagebox.showinfo("Success", f"Database successfully saved to:\n{filename}")
+                self.info_label.config(text=f"Loaded: {os.path.basename(filename)}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save database: {str(e)}")
+                
     def _clear_database(self):
         """Clear the current database."""
         if messagebox.askyesno("Confirm", "Are you sure you want to clear the database?"):
             self.db = None
-            self.filtered_db = None
+            self.search_criteria = {}
+            self.active_filters = {}
             self.current_models = []
             self.selected_simulations = []
             self._clear_all_tabs()
@@ -245,7 +297,7 @@ class ECAApp:
         refresh_btn.grid(row=1, column=0, columnspan=2, pady=5)
         
     def _update_overview_tab(self):
-        """Update the overview tab with current database information."""
+        """Update the overview tab with current database information (respects filters)."""
         if not self.db:
             return
             
@@ -254,8 +306,8 @@ class ECAApp:
             self.sim_tree.delete(item)
         self.prop_text.delete(1.0, tk.END)
         
-        # Get all simulations
-        simulations = self.db.where()
+        # Get simulations based on current filter criteria
+        simulations = self.db.where(**self.search_criteria)
         total_count = len(simulations)
         
         # Populate simulation list with missing path detection
@@ -266,14 +318,14 @@ class ECAApp:
                 display_path = "(Path not found) " + display_path
             self.sim_tree.insert("", tk.END, values=(display_path,))
             
-        # Calculate property statistics
+        # Calculate property statistics inside the filtered set
         all_keys = self.db.all_keys()
         property_stats = {}
         
         for key in all_keys:
             if key == 'path':  # Skip path as it's per-simulation
                 continue
-            unique_values = self.db.unique(key)
+            unique_values = self.db.unique(key, **self.search_criteria)
             if len(unique_values) > 1 and len(unique_values) < total_count:
                 property_stats[key] = {
                     'unique_count': len(unique_values),
@@ -281,7 +333,7 @@ class ECAApp:
                 }
                 
         # Display property summary
-        self.prop_text.insert(tk.END, f"Total Simulations: {total_count}\n")
+        self.prop_text.insert(tk.END, f"Total Displayed Simulations: {total_count}\n")
         self.prop_text.insert(tk.END, "=" * 50 + "\n\n")
         self.prop_text.insert(tk.END, f"Properties with multiple values ({len(property_stats)}):\n\n")
         
@@ -361,7 +413,11 @@ class ECAApp:
         reset_btn = ttk.Button(button_frame, text="Reset to Full Database", command=self._reset_filter)
         reset_btn.pack(side=tk.LEFT, padx=5)
         
-        # Store active filters
+        # Temp window button
+        temp_window_btn = ttk.Button(button_frame, text="New Temp. Window", command=self._open_temp_window)
+        temp_window_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Store active filters locally
         self.active_filters: Dict[str, List[Any]] = {}
         self.filter_val_map = {}
         
@@ -396,8 +452,7 @@ class ECAApp:
         for value in unique_values:
             fmt_val = self._format_value(value)
             
-            # Handle potential string collisions (e.g., 1.2341 and 1.2344 both format to 1.234)
-            # We append invisible spaces to ensure unique keys in our dictionary/listbox
+            # Handle potential string collisions
             while fmt_val in self.filter_val_map and self.filter_val_map[fmt_val] != value:
                 fmt_val += " " 
                 
@@ -416,10 +471,8 @@ class ECAApp:
             messagebox.showwarning("Warning", "Please select at least one value")
             return
             
-        # Get the formatted strings from the listbox
+        # Get exact original values
         selected_strings = [self.filter_values_listbox.get(i) for i in selected_indices]
-        
-        # Use our dictionary to pull the EXACT original values out for the database query
         exact_values = [self.filter_val_map[val_str] for val_str in selected_strings]
                     
         self.active_filters[property_name] = exact_values
@@ -439,8 +492,14 @@ class ECAApp:
             formatted_vals = [self._format_value(v) for v in values]
             self.active_filters_text.insert(tk.END, f"{prop}: {', '.join(formatted_vals)}\n")
             
+    def _build_search_criteria(self):
+        """Build the query dictionary from active filters."""
+        self.search_criteria = {}
+        for prop, values in self.active_filters.items():
+            self.search_criteria[prop] = WhereIn(*values)
+
     def _apply_filter(self):
-        """Apply the active filters to create a sub-database."""
+        """Update the global search criteria used across the application."""
         if not self.db:
             messagebox.showwarning("Warning", "No database loaded")
             return
@@ -450,46 +509,65 @@ class ECAApp:
             return
             
         try:
-            # 1. Get ALL keys from the original database to ensure nothing is lost
-            all_keys = self.db.all_keys()
+            # Build search arguments
+            self._build_search_criteria()
             
-            # 2. Build search criteria from active filters
-            search_criteria = {}
-            for prop, values in self.active_filters.items():
-                search_criteria[prop] = WhereIn(*values)
-                
-            # 3. Extract ALL keys, applying the search criteria
-            # This ensures the filtered database has the same schema as the original
-            self.filtered_db = self.db.extract(all_keys, **search_criteria)
+            # Re-initialize models directly on the master DB for fitting tracking
+            filtered_sims = self.db.where(**self.search_criteria)
+            self.current_models = [ECModel(self.db.db, doc) for doc in filtered_sims]
             
-            # 4. Re-initialize models with the new full-featured database
-            self.current_models = [ECModel(self.filtered_db.db, doc) for doc in self.filtered_db.where()]
-            
-            # 5. Sync downstream views
+            # Sync downstream views
+            self._update_overview_tab()
             self._update_individual_sim_list()
             
-            self._update_status(f"Filtered database: {len(self.current_models)} simulations")
+            self._update_status(f"Filter applied: {len(self.current_models)} simulations match.")
             messagebox.showinfo("Success", f"Filter applied successfully. {len(self.current_models)} simulations match.")
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to apply filter: {str(e)}")
             
+    def _open_temp_window(self):
+        """Extract a sub-database matching filters and open it in a new window."""
+        if not self.db:
+            messagebox.showwarning("Warning", "No database loaded")
+            return
+
+        self._build_search_criteria()
+        if not self.search_criteria:
+            messagebox.showinfo("Info", "No filters applied. The temporary window will contain a copy of the entire database.")
+
+        try:
+            # Extract to an independent, in-memory TinyDB
+            all_keys = self.db.all_keys()
+            temp_db = self.db.extract(all_keys, **self.search_criteria)
+            
+            # Launch new App bound to a Toplevel
+            new_root = tk.Toplevel(self.root)
+            ECAApp(new_root, db=temp_db, is_temp=True)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create temporary window: {str(e)}")
+
     def _clear_filters(self):
-        """Clear all active filters."""
+        """Clear all active filters from UI."""
         self.active_filters.clear()
         self._update_active_filters_display()
         self._update_status("Filters cleared")
         
     def _reset_filter(self):
-        """Reset to the full database."""
-        self.filtered_db = None
-        self.current_models = []
+        """Reset the search criteria so all queries target the full database."""
+        self.search_criteria = {}
         self._clear_filters()
-        self._update_individual_sim_list()
-        self._update_status("Reset to full database")
+        
+        if self.db:
+            self.current_models = [ECModel(self.db.db, doc) for doc in self.db.where()]
+            self._update_overview_tab()
+            self._update_individual_sim_list()
+            self._update_status("Reset to full database")
         
     def _clear_filter_tab(self):
-        """Clear the filter tab."""
+        """Clear the filter tab entirely."""
+        self.search_criteria.clear()
         self.active_filters.clear()
         self._update_active_filters_display()
         self.filter_property_var.set("")
@@ -523,8 +601,6 @@ class ECAApp:
                        variable=self.selection_mode, value="filtered").pack(anchor=tk.W)
         ttk.Radiobutton(selection_frame, text="Use All Simulations", 
                        variable=self.selection_mode, value="all").pack(anchor=tk.W)
-        ttk.Radiobutton(selection_frame, text="Use Selected Simulations", 
-                       variable=self.selection_mode, value="selected").pack(anchor=tk.W)
                        
         # Progress display
         progress_frame = ttk.LabelFrame(tab, text="Progress", padding="5")
@@ -554,14 +630,14 @@ class ECAApp:
         
     def _get_models_to_fit(self) -> List[ECModel]:
         """Get the list of models to fit based on selection mode."""
-        if self.selection_mode.get() == "selected" and self.current_models:
-            return self.current_models
-        elif self.selection_mode.get() == "filtered" and self.filtered_db:
-            return [ECModel(self.filtered_db.db, doc) for doc in self.filtered_db.where()]
-        elif self.db:
-            return [ECModel(self.db.db, doc) for doc in self.db.where()]
-        else:
+        if not self.db:
             return []
+            
+        if self.selection_mode.get() == "filtered" and self.search_criteria:
+            # Note: Because ECModel wraps self.db.db, fits WILL save to the master file
+            return [ECModel(self.db.db, doc) for doc in self.db.where(**self.search_criteria)]
+        else:
+            return [ECModel(self.db.db, doc) for doc in self.db.where()]
             
     def _apply_fit(self, refit=False):
         """Apply the selected fit model to the chosen simulations."""
@@ -577,46 +653,46 @@ class ECAApp:
             return
             
         # Create fit object
-        try:
-            if model_name == "FurmanNoPhoto":
-                fit = FurmanNoPhotoFit()
-            elif model_name == "FurmanPhoto":
-                fit = FurmanPhotoFit()
+        #try:
+        if model_name == "FurmanNoPhoto":
+            fit = FurmanNoPhotoFit()
+        elif model_name == "FurmanPhoto":
+            fit = FurmanPhotoFit()
+        else:
+            messagebox.showerror("Error", f"Unknown fit model: {model_name}")
+            return
+            
+        # Apply fit to all models
+        self.progress_var.set("Starting fit...")
+        self.root.update()
+        
+        success_count = 0
+        fail_count = 0
+        
+        for i in range(len(models)):
+            result = fit.fit(models[i], refit=refit)
+            models[i] = result is not None
+            if result is not None:
+                success_count += 1
             else:
-                messagebox.showerror("Error", f"Unknown fit model: {model_name}")
-                return
+                fail_count += 1
                 
-            # Apply fit to all models
-            self.progress_var.set("Starting fit...")
+            self.progress_var.set(f"Fitting: {i+1}/{len(models)} ({success_count} success, {fail_count} failed)")
             self.root.update()
             
-            success_count = 0
-            fail_count = 0
-            
-            for i in range(len(models)):
-                result = fit.fit(models[i], refit=refit)
-                models[i] = result is not None
-                if result is not None:
-                    success_count += 1
-                else:
-                    fail_count += 1
-                    
-                self.progress_var.set(f"Fitting: {i+1}/{len(models)} ({success_count} success, {fail_count} failed)")
-                self.root.update()
-                
-            # Display results
-            self.results_text.delete(1.0, tk.END)
-            self.results_text.insert(tk.END, f"Fitting Complete\n")
-            self.results_text.insert(tk.END, "=" * 50 + "\n")
-            self.results_text.insert(tk.END, f"Total: {len(models)}\n")
-            self.results_text.insert(tk.END, f"Successful: {success_count}\n")
-            self.results_text.insert(tk.END, f"Failed: {fail_count}\n\n")
-            
-            self._update_status(f"Fitting complete: {success_count}/{len(models)} successful")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Fitting failed: {str(e)}")
-            self._update_status("Fitting failed")
+        # Display results
+        self.results_text.delete(1.0, tk.END)
+        self.results_text.insert(tk.END, f"Fitting Complete\n")
+        self.results_text.insert(tk.END, "=" * 50 + "\n")
+        self.results_text.insert(tk.END, f"Total: {len(models)}\n")
+        self.results_text.insert(tk.END, f"Successful: {success_count}\n")
+        self.results_text.insert(tk.END, f"Failed: {fail_count}\n\n")
+        
+        self._update_status(f"Fitting complete: {success_count}/{len(models)} successful")
+        
+        # except Exception as e:
+        #     messagebox.showerror("Error", f"Fitting failed: {str(e)}")
+        #     self._update_status("Fitting failed")
             
     def _refit_all(self):
         """Refit all simulations with the selected model."""
@@ -702,21 +778,16 @@ class ECAApp:
                 continue
                 
             try:
-                # Get all values for this key to check if they're numeric
                 unique_values = self.db.unique(key)
                 if len(unique_values) <= 1:
                     continue
                 
-                # Check if we have at least one numeric value
                 has_numeric = False
                 for val in unique_values:
-                    # Handle various numeric types
                     if isinstance(val, (int, float, np.number)):
-                        # Make sure it's not NaN or Inf
                         if not (np.isnan(val) or np.isinf(val)):
                             has_numeric = True
                             break
-                    # Also check if it's a string that can be converted to float
                     elif isinstance(val, str):
                         try:
                             float_val = float(val)
@@ -730,7 +801,6 @@ class ECAApp:
                     plotable_props.append(key)
                     
             except Exception as e:
-                # Skip properties that cause errors
                 print(f"Skipping property {key}: {e}")
                 continue
                 
@@ -757,22 +827,21 @@ class ECAApp:
             self.plot_fig.clear()
             ax = self.plot_fig.add_subplot(111)
             
-            # Determine which database to use (filtered or full)
-            db_to_use = self.filtered_db if self.filtered_db else self.db
+            # Since ecaplots.versus_plot generally expects a SimDB input, 
+            # we temporarily extract a subset purely for read-only visualization purposes
+            if self.search_criteria:
+                db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria)
+            else:
+                db_to_use = self.db
             
-            # Call the utility function from ecaplots
-            # We pass the axes object 'ax' to ensure the plot draws in our GUI frame
             if color_prop:
-                # If coloring, we pass the color property
                 versus_plot(db_to_use, x_prop, y_prop, colorBy=color_prop, size=ax)
             else:
-                # No color mapping
                 versus_plot(db_to_use, x_prop, y_prop, size=ax)
             
             # Update the canvas to reflect changes
             self.plot_canvas.draw()
             
-            # Construct a descriptive title for the status bar
             title_suffix = f" (colored by {color_prop})" if color_prop else ""
             self._update_status(f"Plot generated: {y_prop} vs {x_prop}{title_suffix}")
             
@@ -844,7 +913,6 @@ class ECAApp:
         self.individual_fit_combo['values'] = ["None", "FurmanNoPhoto", "FurmanPhoto"]
         self.individual_fit_combo.pack(side=tk.LEFT, padx=5)
         
-        # --- NEW UI CONTROLS ---
         self.individual_central_density_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(fit_frame, text="Use Central Density", variable=self.individual_central_density_var).pack(side=tk.LEFT, padx=10)
 
@@ -852,7 +920,6 @@ class ECAApp:
         self.individual_max_x_var = tk.StringVar()
         self.individual_max_x_entry = ttk.Entry(fit_frame, textvariable=self.individual_max_x_var, width=8)
         self.individual_max_x_entry.pack(side=tk.LEFT, padx=2)
-        # -----------------------
         
         # Optional Plot Button
         plot_btn = ttk.Button(fit_frame, text="Replot (Apply Changes)", command=self._plot_individual_simulation)
@@ -890,12 +957,11 @@ class ECAApp:
         self._update_individual_sim_list()
 
     def _update_individual_sim_list(self):
-        """Update the individual simulation list to match the current columns & database."""
+        """Update the individual simulation list to match the current columns & database filters."""
         for item in self.individual_sim_tree.get_children():
             self.individual_sim_tree.delete(item)
             
-        db_to_use = self.filtered_db if self.filtered_db else self.db
-        if not db_to_use:
+        if not self.db:
             return
             
         # Dynamically set headers
@@ -904,26 +970,21 @@ class ECAApp:
             self.individual_sim_tree.heading(col, text=col)
             self.individual_sim_tree.column(col, width=120 if col != "doc_id" else 60)
             
-        # Iterate over results and fill rows
-        simulations = db_to_use.where()
+        # Iterate over results corresponding to the search filter and fill rows
+        simulations = self.db.where(**self.search_criteria)
         for sim in simulations:
             values = []
             for col in self.individual_columns:
                 if col == "doc_id":
                     values.append(sim.doc_id)
                 else:
-                    # Apply formatting here
                     values.append(self._format_value(sim.get(col, "N/A")))
             self.individual_sim_tree.insert("", tk.END, values=values)
             
     def _plot_individual_simulation(self):
         """Plot selected simulation(s). Auto-triggers on tree selection and allows multi-select."""
         selections = self.individual_sim_tree.selection()
-        if not selections:
-            return
-            
-        db_to_use = self.filtered_db if self.filtered_db else self.db
-        if not db_to_use:
+        if not selections or not self.db:
             return
             
         # Clear previous plot
@@ -949,14 +1010,12 @@ class ECAApp:
             except (ValueError, IndexError):
                 continue
                 
-            #try:
-            # Initialize model without executing data reads
-            model = ECModel(db_to_use.db, doc_id)
+            # Initialize model directly from the main database
+            model = ECModel(self.db.db, doc_id)
             path_exists = os.path.exists(model.path) and os.path.exists(os.path.join(model.path, "Pyecltest.mat"))
             
             fits_to_plot = [FitClass() for FitClass in fit_classes]
 
-            # If there's no data and no fits selected, we skip entirely
             if not path_exists and not fits_to_plot:
                 continue
             
@@ -983,7 +1042,6 @@ class ECAApp:
             if not path_exists and fit_max_x <= 0:
                     fit_max_x = 300.0
             
-            # Hook into new functionality inside ecaplots
             model_plot(
                 model=model,
                 fits=fits_to_plot,
@@ -995,9 +1053,6 @@ class ECAApp:
             )
                         
             plotted_count += 1
-                
-            # except Exception as e:
-            #     print(f"Plot failed for ID {doc_id}: {e}")
                 
         if plotted_count > 0:
             self.individual_fig.tight_layout()

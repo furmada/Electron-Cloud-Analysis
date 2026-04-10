@@ -893,14 +893,18 @@ class Fit(object):
 
     def limit_estimate(self, xdata: np.ndarray, ydata: np.ndarray) -> float:
         """Estimate the limit of f(x) using the x and y data"""
+        if len(ydata) == 0:
+            return 0
+        elif len(ydata) == 1:
+            return ydata[0]
         smooth_diff = smooth(np.diff(ydata), max(ydata.size // 10, 5))
         where_max = np.argmax(smooth_diff)
         if where_max > smooth_diff.size / 2:
             # We have likely not completed the buildup within the simulation window
-            return  (3 + (where_max / smooth_diff.size))*ydata[-1]
+            return  (3 + (where_max / smooth_diff.size))*np.max(ydata)
         else:
             # Return an estimate based on the average slope in the last window
-            return min(ydata[-1] + max(np.mean(smooth_diff[-max(ydata.size // 10, 5):]), 0), np.max(ydata))
+            return min(np.mean(ydata[-5:-1]) + max(np.mean(smooth_diff[-max(ydata.size // 10, 5):]), 0), np.max(ydata))
 
     def _mget(self, attr: str, model: ECModel, default: bool | float | int | np.number | np.ndarray = False):
         return getattr(model, self.name+"_"+attr) if hasattr(model, "_"+self.name+"_"+attr) or hasattr(model, self.name+"_"+attr) else default
@@ -924,7 +928,7 @@ class Fit(object):
                 eval_context[name] = free_params[free_ptr]
                 free_ptr += 1
         # Use a restricted eval on the pre-compiled code object
-        return eval(code, {"__builtins__": {}}, eval_context)
+        return eval(code, eval_context)
 
     def _make_target(self):
         fixed_mask = self.fixed.copy()
@@ -974,7 +978,7 @@ class Fit(object):
                     p0=self.initial_guess[~self.fixed],
                     bounds=(self.bounds_lower[~self.fixed], self.bounds_upper[~self.fixed]),
                     loss="arctan",
-                    maxfev=1e4,
+                    maxfev=1e5,
                     nan_policy="omit",
                     ftol=1e-10
                 )
@@ -1068,7 +1072,7 @@ class FurmanNoPhotoFit(Fit):
             mslope = np.argmin(np.square(ydata - ((ydata[-1] - ydata[0])/2)))
             bounds = {
                 "yc": (model.Ne_0 * scale_y, self.limit_estimate(xdata, ydata)*scale_y),
-                "beta": (0, max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
+                "beta": (0, np.inf)#max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
             }
             self.initial({
                 "yc": self.limit_estimate(xdata, ydata)*scale_y,
@@ -1118,18 +1122,32 @@ class FurmanPhotoFit(Fit):
         _, scale_y = self.scale_factor(model, xdata, ydata)
         self.fix({"y0": model.Ne_0 * scale_y})
         if model.buildup:
-            mslope = np.argmin(np.square(ydata - (ydata[-1]/2)))
-            bounds = {
-                "yc": (model.Ne_0 * scale_y, self.limit_estimate(xdata, ydata)*scale_y),
-                "alpha": (0, 2*model.k_pe_st*scipy.constants.c*model.b_spac),
-                "beta": (0, max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
-            }
+            # mslope = np.argmin(np.square(ydata - (ydata[-1]/2)))
+            # bounds = {
+            #     "yc": (model.Ne_0 * scale_y, 2*self.limit_estimate(xdata, ydata)*scale_y),
+            #     "alpha": (0, 2*model.k_pe_st*scipy.constants.c*model.b_spac),
+            #     "beta": (0, np.inf)
+            # }
+            # self.initial({
+            #     "yc": self.limit_estimate(xdata, ydata)*scale_y,
+            #     "alpha": model.k_pe_st*scipy.constants.c*model.b_spac,
+            #     "beta": min(1, abs(4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)))
+            # })
+            np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
+            if np_result is None:
+                self._mset("success", False, model)
+                setattr(model, "_"+self.name+"_fitting_error", "The underlying NoPhoto fit failed.")
+                return None
+            self.bound({
+                "yc": (model.Ne_0 * scale_y, max(self.limit_estimate(xdata, ydata)*scale_y, np_result[0,0])),
+                "alpha": (0, model.k_pe_st*scipy.constants.c*model.b_spac),
+                "beta": (0, max(np_result[0,1], 1))
+            })
             self.initial({
                 "yc": self.limit_estimate(xdata, ydata)*scale_y,
                 "alpha": model.k_pe_st*scipy.constants.c*model.b_spac,
-                "beta": min(1, abs(4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)))
+                "beta": min(1, np_result[0,1])
             })
-            self.bound(bounds)
             return super().fit(model, refit)
         else:
             self._mset("success", False, model)
