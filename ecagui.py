@@ -563,14 +563,14 @@ class ECAApp:
         else:
             return []
             
-    def _apply_fit(self):
+    def _apply_fit(self, refit=False):
         """Apply the selected fit model to the chosen simulations."""
         if not self.db:
             messagebox.showwarning("Warning", "No database loaded")
             return
             
         model_name = self.fit_model_var.get()
-        models = self._get_models_to_fit()
+        models = list(self._get_models_to_fit())
         
         if not models:
             messagebox.showwarning("Warning", "No simulations to fit")
@@ -593,8 +593,9 @@ class ECAApp:
             success_count = 0
             fail_count = 0
             
-            for i, model in enumerate(models):
-                result = fit.fit(model, refit=False)
+            for i in range(len(models)):
+                result = fit.fit(models[i], refit=refit)
+                models[i] = result is not None
                 if result is not None:
                     success_count += 1
                 else:
@@ -626,7 +627,7 @@ class ECAApp:
         if not messagebox.askyesno("Confirm", "This will refit all selected simulations. Continue?"):
             return
             
-        self._apply_fit()
+        self._apply_fit(True)
         
     def _clear_fitting_tab(self):
         """Clear the fitting tab."""
@@ -948,54 +949,55 @@ class ECAApp:
             except (ValueError, IndexError):
                 continue
                 
-            try:
-                # Initialize model without executing data reads
-                model = ECModel(db_to_use.db, doc_id)
-                path_exists = os.path.exists(model.path) and os.path.exists(os.path.join(model.path, "Pyecltest.mat"))
-                
-                fits_to_plot = [FitClass() for FitClass in fit_classes]
+            #try:
+            # Initialize model without executing data reads
+            model = ECModel(db_to_use.db, doc_id)
+            path_exists = os.path.exists(model.path) and os.path.exists(os.path.join(model.path, "Pyecltest.mat"))
+            
+            fits_to_plot = [FitClass() for FitClass in fit_classes]
 
-                # If there's no data and no fits selected, we skip entirely
-                if not path_exists and not fits_to_plot:
-                    continue
+            # If there's no data and no fits selected, we skip entirely
+            if not path_exists and not fits_to_plot:
+                continue
+            
+            # Determine central density flag based on UI toggle and data availability
+            cd_param = self.individual_central_density_var.get() if path_exists else None
+            
+            # Read Max X override, calculate default if empty
+            max_x_str = self.individual_max_x_var.get().strip()
+            if not max_x_str:
+                try:
+                    fit_max_x = (model.cutoff / model.bunch_step) * 1.25
+                    # Display the default if only one simulation is selected
+                    if len(selections) == 1:
+                        self.individual_max_x_var.set(f"{fit_max_x:.1f}")
+                except Exception:
+                    fit_max_x = 300.0
+            else:
+                try:
+                    fit_max_x = float(max_x_str)
+                except ValueError:
+                    fit_max_x = 300.0
+            
+            # Guard rails for plotting empty paths
+            if not path_exists and fit_max_x <= 0:
+                    fit_max_x = 300.0
+            
+            # Hook into new functionality inside ecaplots
+            model_plot(
+                model=model,
+                fits=fits_to_plot,
+                size=ax,
+                show_error=True,
+                central_density=cd_param,
+                fit_maxX=fit_max_x,
+                label=str(doc_id)
+            )
+                        
+            plotted_count += 1
                 
-                # Determine central density flag based on UI toggle and data availability
-                cd_param = self.individual_central_density_var.get() if path_exists else None
-                
-                # Read Max X override, calculate default if empty
-                max_x_str = self.individual_max_x_var.get().strip()
-                if not max_x_str:
-                    try:
-                        fit_max_x = (model.cutoff / model.bunch_step) * 1.25
-                        # Display the default if only one simulation is selected
-                        if len(selections) == 1:
-                            self.individual_max_x_var.set(f"{fit_max_x:.1f}")
-                    except Exception:
-                        fit_max_x = 300.0
-                else:
-                    try:
-                        fit_max_x = float(max_x_str)
-                    except ValueError:
-                        fit_max_x = 300.0
-                
-                # Guard rails for plotting empty paths
-                if not path_exists and fit_max_x <= 0:
-                     fit_max_x = 300.0
-                
-                # Hook into new functionality inside ecaplots
-                model_plot(
-                    model=model,
-                    fits=fits_to_plot,
-                    size=ax,
-                    show_error=True,
-                    central_density=cd_param,
-                    fit_maxX=fit_max_x
-                )
-                            
-                plotted_count += 1
-                
-            except Exception as e:
-                print(f"Plot failed for ID {doc_id}: {e}")
+            # except Exception as e:
+            #     print(f"Plot failed for ID {doc_id}: {e}")
                 
         if plotted_count > 0:
             self.individual_fig.tight_layout()

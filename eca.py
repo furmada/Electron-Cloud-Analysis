@@ -891,6 +891,17 @@ class Fit(object):
             self.fixed[i - 1] = True
             self.fixed_values[i - 1] = f
 
+    def limit_estimate(self, xdata: np.ndarray, ydata: np.ndarray) -> float:
+        """Estimate the limit of f(x) using the x and y data"""
+        smooth_diff = smooth(np.diff(ydata), max(ydata.size // 10, 5))
+        where_max = np.argmax(smooth_diff)
+        if where_max > smooth_diff.size / 2:
+            # We have likely not completed the buildup within the simulation window
+            return  (3 + (where_max / smooth_diff.size))*ydata[-1]
+        else:
+            # Return an estimate based on the average slope in the last window
+            return min(ydata[-1] + max(np.mean(smooth_diff[-max(ydata.size // 10, 5):]), 0), np.max(ydata))
+
     def _mget(self, attr: str, model: ECModel, default: bool | float | int | np.number | np.ndarray = False):
         return getattr(model, self.name+"_"+attr) if hasattr(model, "_"+self.name+"_"+attr) or hasattr(model, self.name+"_"+attr) else default
     
@@ -953,7 +964,7 @@ class Fit(object):
         First checks for an existing fit, and skips fitting unless "refit" is True.
         If the fit fails, the exception is stored as _furman_no_photo_fitting_error.
         """
-        if (not self._mget("success", model)) or refit:
+        if refit or (not self._mget("success", model)):
             try:
                 xdata, ydata = self.select_data(model)
                 scale_x, scale_y = self.scale_factor(model, xdata, ydata)
@@ -962,9 +973,10 @@ class Fit(object):
                     scale_x * xdata, scale_y * ydata,
                     p0=self.initial_guess[~self.fixed],
                     bounds=(self.bounds_lower[~self.fixed], self.bounds_upper[~self.fixed]),
-                    loss="soft_l1",
+                    loss="arctan",
                     maxfev=1e4,
-                    nan_policy="omit"
+                    nan_policy="omit",
+                    ftol=1e-10
                 )
                 perr = np.sqrt(np.diag(covariance))
                 # Store the parameter values
@@ -978,9 +990,12 @@ class Fit(object):
                         self._mset(v+"_err", perr[f], model)
                         f += 1
                 self._mset("success", True, model)
+                if hasattr(model, "_data"): delattr(model, "_data")
+                if hasattr(model, "_smooth"): delattr(model, "_smooth")
+                if hasattr(model, "_smooth_diff"): delattr(model, "_smooth_diff")
             except (RuntimeError, ValueError) as e:
                 self._mset("success", False, model)
-                setattr(model, "_"+self.name+"_fitting_error", e)
+                setattr(model, "_"+self.name+"_fitting_error", str(e))
                 return None
             self._reset_state()
         return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
@@ -1045,18 +1060,18 @@ class FurmanNoPhotoFit(Fit):
         self._mset("scale_y", scale_y, model)
         return (scale_x, scale_y)
     
-    def fit(self, model: ECModel, refit=False) -> np.ndarray | None:
+    def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
         xdata, ydata = self.select_data(model)
         _, scale_y = self.scale_factor(model, xdata, ydata)
         self.fix({"y0": model.Ne_0 * scale_y})
         if model.buildup:
             mslope = np.argmin(np.square(ydata - ((ydata[-1] - ydata[0])/2)))
             bounds = {
-                "yc": (model.Ne_0 * scale_y, 2*model.N_electrons[model.cutoff]*scale_y),
+                "yc": (model.Ne_0 * scale_y, self.limit_estimate(xdata, ydata)*scale_y),
                 "beta": (0, max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
             }
             self.initial({
-                "yc": model.N_electrons[model.cutoff]*scale_y,
+                "yc": self.limit_estimate(xdata, ydata)*scale_y,
                 "beta": min(1, abs(4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)))
             })
         else:
@@ -1098,19 +1113,19 @@ class FurmanPhotoFit(Fit):
         self._mset("scale_y", scale_y, model)
         return (scale_x, scale_y)
     
-    def fit(self, model: ECModel, refit=False) -> np.ndarray | None:
+    def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
         xdata, ydata = self.select_data(model)
         _, scale_y = self.scale_factor(model, xdata, ydata)
         self.fix({"y0": model.Ne_0 * scale_y})
         if model.buildup:
             mslope = np.argmin(np.square(ydata - (ydata[-1]/2)))
             bounds = {
-                "yc": (model.Ne_0 * scale_y, 2*model.N_electrons[model.cutoff]*scale_y),
-                "alpha": (0, np.inf),
+                "yc": (model.Ne_0 * scale_y, self.limit_estimate(xdata, ydata)*scale_y),
+                "alpha": (0, 2*model.k_pe_st*scipy.constants.c*model.b_spac),
                 "beta": (0, max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
             }
             self.initial({
-                "yc": model.N_electrons[model.cutoff]*scale_y,
+                "yc": self.limit_estimate(xdata, ydata)*scale_y,
                 "alpha": model.k_pe_st*scipy.constants.c*model.b_spac,
                 "beta": min(1, abs(4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)))
             })
@@ -1118,7 +1133,7 @@ class FurmanPhotoFit(Fit):
             return super().fit(model, refit)
         else:
             self._mset("success", False, model)
-            setattr(model, "_"+self.name+"_fitting_error", ValueError("Cannot fit photoemission model for non-buildup simulation."))
+            setattr(model, "_"+self.name+"_fitting_error", "Cannot fit photoemission model for non-buildup simulation.")
             return None
         
 
@@ -1127,6 +1142,8 @@ def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True
     For the database db, apply the Fit to each result of the search (using where()),
     returning an ECModel instance for each result.
     """
+    if not refit:
+        search = {**search, fit.name+"_success": False}
     results = db.where(**search)
     for i, result in enumerate(results):
         model = ECModel(db.db, result)

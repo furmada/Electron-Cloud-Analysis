@@ -18,7 +18,7 @@ def _axes(size: tuple[int, int] | None | Axes) -> Axes:
 
 def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None | Axes = (10, 5),
                  log: tuple[bool, bool] = (False, False), show_error: bool = True, refit: bool = False,
-                 central_density: bool | None = False, fit_maxX: float = -1.0):
+                 central_density: bool | None = False, fit_maxX: float = -1.0, label: str | None = None):
     """
     Plot the raw data and each Fit if it succeeded.
     """
@@ -34,7 +34,7 @@ def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None
                 F = model.N_electrons[::step]
             if fit_maxX > 0:
                 B, F = B[B <= fit_maxX], F[B <= fit_maxX]
-            ax.scatter(B, F, s=1, label="Data")
+            ax.scatter(B, F, s=1, label=("" if label is None else label + " ") + "Data")
     else:
         for fit in fits:
             result = fit.fit(model, refit=refit)
@@ -49,13 +49,13 @@ def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None
             B = (T - model.t_offs) / model.b_spac
             Bsmooth = (Tsmooth - model.t_offs) / model.b_spac
             if not (result is None):
-                ax.plot(Bsmooth, fit.fit_function(model)(Tsmooth), label="Fit: {}".format(fit.name))
+                ax.plot(Bsmooth, fit.fit_function(model)(Tsmooth), label=("" if label is None else label + " ") + fit.name + " Fit")
                 if show_error:
                     ax.fill_between(
                         Bsmooth,
                         fit.fit_function(model, result[0] - result[1])(Tsmooth),
                         fit.fit_function(model, result[0] + result[1])(Tsmooth),
-                        alpha=0.2, label="Err: {}".format(fit.name))
+                        alpha=0.2, label=("" if label is None else label + " ") + fit.name + " Fit Error")
             else:
                 print("Fitting failed: {}".format(getattr(model, "_"+fit.name+"_fitting_error")))
             if not (central_density is None):
