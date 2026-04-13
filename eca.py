@@ -270,6 +270,19 @@ class SimDB(object):
         """
         if len(search) == 0:
             return self.db.all()
+        # Searching by document ID requires special handling
+        if "doc_id" in search:
+            if isinstance(search["doc_id"], WhereIn):
+                return [self.db.get(doc_id=int(i)) for i in search["doc_id"].match]
+            elif isinstance(search["doc_id"], Callable):
+                return [r for r in self.db.all() if search["doc_id"](r.doc_id, r)]
+            return [self.db.get(doc_id=int(search["doc_id"]))]
+        if "_doc_id" in search:
+            if type(search["_doc_id"]) == str:
+                search["_doc_id"] = lambda r: eval(compile(v, "query_expr", "eval"), {"np": np, "scipy": scipy, "ECModel": ECModel, "db": self}, {rk: rv for rk, rv in r.items()})
+            if isinstance(search["_doc_id"], Callable):
+                return [r for r in self.db.all() if search["doc_id"](r)]
+        # We also support direct TinyDB queries
         if "query" in search and isinstance(search["query"], Query):
             return self.db.search(search["query"])
         non_dynamic = {}
@@ -295,7 +308,7 @@ class SimDB(object):
                 all_filters = True
                 for k, filter_fn in dynamic.items():
                     try:
-                        if not (filter_fn(result[k], result) if (k in result) else (filter_fn(result) if k.startswith("_") else False)):
+                        if not (filter_fn(result[k[1:]], result) if (k[1:] in result) else (filter_fn(result) if k.startswith("_") else False)):
                             all_filters = False
                             break
                     except NameError:
@@ -343,6 +356,17 @@ class SimDB(object):
             return unique
         else: 
             return list(sorted(set(values)))
+
+    def closest(self, entry: dict, **search) -> list[dict]:
+        """
+        Finds the entries in the database which matches the greatest number of properties with "entry".
+        """
+        all_entries = self.where(**search)
+        matching = np.zeros(len(all_entries), dtype=int)
+        match_on = list(entry.keys())
+        for i, e in enumerate(all_entries):
+            matching[i] = sum([1 for k in match_on if k in e and e[k] == entry[k]])
+        return [all_entries[int(i)] for i in np.argwhere(matching == np.min(matching)).ravel().astype(int)]
 
     def extract(self, attrs: Iterable[str], **search) -> SimDB:
         """
@@ -445,6 +469,13 @@ class WhereIn(object):
         if hasattr(self, "match_str") and str(value) in self.match_str:
             return True
         return False
+
+class WhereNot(WhereIn):
+    """
+    Inverts the query.
+    """
+    def query(self, value, _):
+        return not super().query(value, _)
 
 
 class SynchedEntry(object):
@@ -552,7 +583,10 @@ def smooth(array: np.ndarray, window: int | np.integer) -> np.ndarray:
     if window > array.size / 2: window = array.size // 10
     for i in range(window):
         smoothed[i] = np.mean(array[:i+1])*(1 - (i/window)) + np.mean(array[i+1:i+1+window])*(i/window)
-    smoothed[window:-window+1] = np.convolve(array[window:], np.ones(window) / window, "valid")
+    try:
+        smoothed[window:-window+1] = np.convolve(array[window:], np.ones(window) / window, "valid")
+    except ValueError:
+        return array
     for i in range(len(smoothed)-window+1, len(smoothed)):
         smoothed[i] = np.mean(array[i-window//2:])
     return smoothed
@@ -578,6 +612,7 @@ class ECModel(SynchedEntry):
         result = doc if isinstance(doc, Document) else (db if isinstance(db, TinyDB) else db.db).get(doc_id=doc)
         if result is None: raise KeyError("The provided doc_id={} does not exist in the database!".format(doc))
         super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, ECModel.PROPERTIES)
+        self.doc_id = result.doc_id
         # Populate this object with information from the database entry
         for k, v in result.items():
             self.set_sync(k)
@@ -895,8 +930,8 @@ class Fit(object):
         """Estimate the limit of f(x) using the x and y data"""
         if len(ydata) == 0:
             return 0
-        elif len(ydata) == 1:
-            return ydata[0]
+        elif len(ydata) <= 5:
+            return ydata[-1]
         smooth_diff = smooth(np.diff(ydata), max(ydata.size // 10, 5))
         where_max = np.argmax(smooth_diff)
         if where_max > smooth_diff.size / 2:
