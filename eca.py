@@ -277,26 +277,20 @@ class SimDB(object):
             elif isinstance(search["doc_id"], Callable):
                 return [r for r in self.db.all() if search["doc_id"](r.doc_id, r)]
             return [self.db.get(doc_id=int(search["doc_id"]))]
-        if "_doc_id" in search:
-            if type(search["_doc_id"]) == str:
-                search["_doc_id"] = lambda r: eval(compile(v, "query_expr", "eval"), {"np": np, "scipy": scipy, "ECModel": ECModel, "db": self}, {rk: rv for rk, rv in r.items()})
-            if isinstance(search["_doc_id"], Callable):
-                return [r for r in self.db.all() if search["doc_id"](r)]
         # We also support direct TinyDB queries
         if "query" in search and isinstance(search["query"], Query):
             return self.db.search(search["query"])
         non_dynamic = {}
         dynamic = {}
         for k, v in search.items():
-            if k.startswith("_"):
-                if type(v) == str:
-                    comp = compile(v, "query_expr", "eval")
-                    context = {"np": np, "scipy": scipy, "ECModel": ECModel, "db": self}
-                    dynamic[k] = lambda r: eval(comp, context, {rk: rv for rk, rv in r.items()})
-                elif isinstance(v, Callable):
-                    dynamic[k] = v
-                elif isinstance(v, np.ndarray):
-                    non_dynamic[k] = v.tolist()
+            if type(v) == str and k.startswith("_"):
+                comp = compile(v, "query_expr", "eval")
+                context = {"np": np, "scipy": scipy, "ECModel": ECModel, "db": self}
+                dynamic[k] = lambda r: eval(comp, context, {rk: rv for rk, rv in r.items()})
+            elif isinstance(v, Callable):
+                dynamic[k] = v
+            elif isinstance(v, np.ndarray):
+                non_dynamic[k] = v.tolist()
             elif isinstance(v, WhereIn):
                 dynamic[k] = v.query
             else:
@@ -308,7 +302,7 @@ class SimDB(object):
                 all_filters = True
                 for k, filter_fn in dynamic.items():
                     try:
-                        if not (filter_fn(result[k[1:]], result) if (k[1:] in result) else (filter_fn(result) if k.startswith("_") else False)):
+                        if not (filter_fn(result[k], result) if (k in result) else (filter_fn(result) if k.startswith("_") else False)):
                             all_filters = False
                             break
                     except NameError:
