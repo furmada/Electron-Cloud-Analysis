@@ -26,6 +26,68 @@ except ImportError as e:
     sys.exit(1)
 
 
+class FilterDefinition:
+    """Serializable filter definition for copy-paste support."""
+    
+    @staticmethod
+    def to_dict(filter_obj: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert filter object to serializable dictionary."""
+        result = {"type": filter_obj["type"]}
+        
+        if filter_obj["type"] == "exact":
+            result["property"] = filter_obj["property"]
+            result["values"] = [
+                str(v) if isinstance(v, (list, np.ndarray)) else v 
+                for v in filter_obj["values"]
+            ]
+        elif filter_obj["type"] == "condition":
+            result["property"] = filter_obj["property"]
+            result["operator"] = filter_obj["operator"]
+            result["value"] = filter_obj["value"]
+        else:  # expression
+            result["expr"] = filter_obj["expr"]
+        
+        return result
+    
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Reconstruct filter object from serialized dictionary."""
+        if data["type"] == "exact":
+            return {
+                "type": "exact",
+                "property": data["property"],
+                "values": data["values"]
+            }
+        elif data["type"] == "condition":
+            return {
+                "type": "condition",
+                "property": data["property"],
+                "operator": data["operator"],
+                "value": data["value"]
+            }
+        else:  # expression
+            return {
+                "type": "expression",
+                "expr": data["expr"]
+            }
+    
+    @staticmethod
+    def serialize_all(filters: List[Dict[str, Any]]) -> str:
+        """Serialize all filters to JSON string."""
+        return json.dumps([FilterDefinition.to_dict(f) for f in filters], indent=2)
+    
+    @staticmethod
+    def deserialize_all(json_str: str) -> List[Dict[str, Any]]:
+        """Deserialize filters from JSON string."""
+        try:
+            data = json.loads(json_str)
+            if not isinstance(data, list):
+                raise ValueError("Filter data must be a JSON array")
+            return [FilterDefinition.from_dict(item) for item in data]
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON format: {e}")
+
+
 class ECAApp:
     """Main application class for the Electron Cloud Analysis GUI."""
     
@@ -385,12 +447,15 @@ class ECAApp:
         
         ttk.Button(control_frame, text="Add Filter", command=self._add_filter).pack(pady=5)
         
-        filters_frame = ttk.LabelFrame(tab, text="Active Filters", padding="5")
+        filters_frame = ttk.LabelFrame(tab, text="Active Filters (JSON Format - Copy/Paste)", padding="5")
         filters_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
         tab.rowconfigure(2, weight=1)
         
-        self.active_filters_text = scrolledtext.ScrolledText(filters_frame, height=8, wrap=tk.WORD)
+        self.active_filters_text = scrolledtext.ScrolledText(filters_frame, height=8, wrap=tk.WORD, font=("TkFixedFont", 9))
         self.active_filters_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Add context menu for copy/paste
+        self.active_filters_text.bind("<Button-3>", self._show_filter_context_menu)
         
         button_frame = ttk.Frame(tab)
         button_frame.grid(row=3, column=0, pady=10)
@@ -505,23 +570,46 @@ class ECAApp:
         self.active_filters_list.append({"type": "expression", "expr": expr})
 
     def _update_active_filters_display(self):
-        """Update the active filters display text box."""
+        """Update the active filters display in JSON format."""
         self.active_filters_text.delete(1.0, tk.END)
+        
         if not self.active_filters_list:
-            self.active_filters_text.insert(tk.END, "No active filters\n")
+            self.active_filters_text.insert(tk.END, "[]")
             return
         
-        self.active_filters_text.insert(tk.END, "Active Filters:\n" + "-" * 30 + "\n")
+        json_str = FilterDefinition.serialize_all(self.active_filters_list)
+        self.active_filters_text.insert(tk.END, json_str)
+
+    def _show_filter_context_menu(self, event):
+        """Show context menu for filter textbox."""
+        context_menu = tk.Menu(self.root, tearoff=0)
+        context_menu.add_command(label="Copy", command=self._copy_filters)
+        context_menu.add_command(label="Paste", command=self._paste_filters)
+        context_menu.add_separator()
+        context_menu.add_command(label="Clear", command=self._clear_filters)
         
-        for i, f_data in enumerate(self.active_filters_list):
-            if f_data["type"] == "exact":
-                formatted_vals = [self._format_value(v) for v in f_data["values"]]
-                self.active_filters_text.insert(tk.END, f"[{i+1}] Exact: {f_data['property']} in ({', '.join(formatted_vals)})\n")
-            elif f_data["type"] == "condition":
-                val_fmt = f"'{f_data['value']}'" if isinstance(f_data['value'], str) else f_data['value']
-                self.active_filters_text.insert(tk.END, f"[{i+1}] Condition: {f_data['property']} {f_data['operator']} {val_fmt}\n")
-            else:  # expression
-                self.active_filters_text.insert(tk.END, f"[{i+1}] Expression: {f_data['expr']}\n")
+        try:
+            context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            context_menu.grab_release()
+
+    def _copy_filters(self):
+        """Copy filter definitions to clipboard."""
+        json_str = FilterDefinition.serialize_all(self.active_filters_list)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(json_str)
+        self._update_status("Filters copied to clipboard")
+
+    def _paste_filters(self):
+        """Paste filter definitions from clipboard."""
+        try:
+            clipboard_data = self.root.clipboard_get()
+            new_filters = FilterDefinition.deserialize_all(clipboard_data)
+            self.active_filters_list.extend(new_filters)
+            self._update_active_filters_display()
+            self._update_status(f"Pasted {len(new_filters)} filter(s)")
+        except ValueError as e:
+            messagebox.showerror("Error", f"Failed to paste filters: {str(e)}")
 
     def _build_search_criteria(self):
         """Build query dictionary from active filters."""
@@ -696,28 +784,28 @@ class ECAApp:
             messagebox.showwarning("Warning", "No simulations to fit")
             return
         
-        try:
-            fit_class = self.FIT_MODELS.get(model_name)
-            if not fit_class:
-                raise ValueError(f"Unknown fit model: {model_name}")
-            
-            fit = fit_class(self.db) if model_name == "FurmanNPMC" else fit_class()
-            
-            self.progress_var.set("Starting fit...")
-            self.root.update()
-            
-            success_count = sum(1 for i, model in enumerate(models)
-                               if self._execute_fit(fit, model, refit, i, len(models)))
-            
-            self._display_fit_results(success_count, len(models))
-        except Exception as e:
-            messagebox.showerror("Error", f"Fitting failed: {str(e)}")
-            self._update_status("Fitting failed")
+        #try:
+        fit_class = self.FIT_MODELS.get(model_name)
+        if not fit_class:
+            raise ValueError(f"Unknown fit model: {model_name}")
+        
+        fit = fit_class(self.db) if model_name == "FurmanNPMC" else fit_class()
+        
+        self.progress_var.set("Starting fit...")
+        self.root.update()
+        
+        success_count = sum(1 for i, model in enumerate(models)
+                            if self._execute_fit(fit, model, refit, i, len(models)))
+        
+        self._display_fit_results(success_count, len(models))
+        # except Exception as e:
+        #     messagebox.showerror("Error", f"Fitting failed: {str(e)}")
+        #     self._update_status("Fitting failed")
 
     def _execute_fit(self, fit, model: ECModel, refit: bool, current: int, total: int) -> bool:
         """Execute a single fit and update progress."""
         result = fit.fit(model, refit=refit)
-        self.progress_var.set(f"Fitting: {current+1}/{total} (Success: {current+bool(result)})")
+        self.progress_var.set(f"Fitting: {current+1}/{total}")
         self.root.update()
         return result is not None
 
@@ -833,7 +921,7 @@ class ECAApp:
             ax = self.plot_fig.add_subplot(111)
             
             db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
-            versus_plot(db_to_use, x_prop, y_prop, colorBy=color_prop, size=ax) if color_prop else versus_plot(db_to_use, x_prop, y_prop, size=ax)
+            versus_plot(db_to_use, x_prop, y_prop, colorBy=color_prop, size=ax)
             
             self.plot_canvas.draw()
             title_suffix = f" (colored by {color_prop})" if color_prop else ""

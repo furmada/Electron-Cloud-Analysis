@@ -75,28 +75,40 @@ def versus_plot(db: SimDB, paramA: str, paramB: str, colorBy: str | None = None,
     """
     ax = _axes(size)
     fig = plt.gcf()
-    table = db.versus(
-        [paramA] + ([] if colorBy is None else [paramA]),
-        [paramB] + ([] if colorBy is None else [colorBy]),
-        **restrict
-    )
-    ax.scatter(
-        table[0][0],
-        table[0][1],
-        c=None if colorBy is None else table[1][1],
-        s=dot_size,
-        cmap=plt.cm.viridis if colormap is None else colormap
-    )
-    if not colorBy is None:
+    
+    if colorBy is None:
+        # When no coloring variable is specified, just get X and Y data
+        table = db.versus(paramA, paramB, **restrict)
+        ax.scatter(
+            table[0],
+            table[1],
+            s=dot_size,
+            cmap=plt.cm.viridis if colormap is None else colormap
+        )
+    else:
+        # When coloring by a variable, get X, Y, and color data
+        table = db.versus(
+            [paramA, paramA],
+            [paramB, colorBy],
+            **restrict
+        )
+        ax.scatter(
+            table[0][0],
+            table[0][1],
+            c=table[1][1],
+            s=dot_size,
+            cmap=plt.cm.viridis if colormap is None else colormap
+        )
         fig.colorbar(plt.cm.ScalarMappable(norm=Normalize(vmin=min(table[1][1]), vmax=max(table[1][1])), cmap=plt.cm.viridis if colormap is None else colormap), ax=ax)
+    
     if log[0]: ax.set_xscale("log")
     if log[1]: ax.set_yscale("log")
     if not size is None:
         ax.set_xlabel(paramA)
         ax.set_ylabel(paramB)
-        ax.set_title("{}({}){}".format(paramB, paramA, "by " + colorBy if not colorBy is None else ""))
+        ax.set_title("{}({}){}".format(paramB, paramA, " by " + colorBy if colorBy is not None else ""))
 
-    return (table[0][0], table[0][1]) if colorBy is None else (table[0][0], table[0][1], table[1][1])
+    return table if colorBy is None else (table[0][0], table[0][1], table[1][1])
 
 def histogram_plot(db: SimDB, param: str, bins: int | str = 'auto', 
                    size: tuple[int, int] | None | Axes = (8, 6), 

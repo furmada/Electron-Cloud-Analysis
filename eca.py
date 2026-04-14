@@ -356,6 +356,8 @@ class SimDB(object):
         Finds the entries in the database which matches the greatest number of properties with "entry".
         """
         all_entries = self.where(**search)
+        if len(all_entries) == 0:
+            return []
         matching = np.zeros(len(all_entries), dtype=int)
         match_on = list(entry.keys())
         for i, e in enumerate(all_entries):
@@ -1158,29 +1160,35 @@ class FurmanNPMCFit(FurmanNoPhotoFit):
             self.bound({"b0": (-2*abs(model.furman_np_beta), 2*abs(model.furman_np_beta))})
             self.initial({"b0": model.furman_np_beta})
         else:
+            self.fix({
+                    "y0": model.furman_np_y0,
+                    "yc": model.furman_np_yc,
+                })
             base_search = self.db.where(doc_id=model.doc_id)[0]
             base_model = self.db.closest(base_search, photoemission=False, furman_np_success=True, B_multip=[0])
-            if len(base_model) == 0:
-                self._mset("success", False, model)
-                setattr(model, "_"+self.name+"_fitting_error", "A base model with B=[0] was not found.")
-                return None
-            base_model = ECModel(model.db, base_model[0])
-            if base_model.furman_np_beta > 0:
-                base_beta = base_model.furman_np_beta
+            if len(base_model) != 0:
+                base_model = ECModel(model.db, base_model[0])
+                if base_model.furman_np_beta > 0:
+                    base_beta = base_model.furman_np_beta
+                else:
+                    base_beta = (model.furman_np_beta / 2)
+                self.initial({
+                    "b0": base_beta,
+                    "b1": 0
+                })
+                self.bound({
+                    "b0": (0, 2*base_beta),
+                    "b1": (-base_beta, base_beta),
+                })
             else:
-                base_beta = (model.furman_np_beta / 2)
-            self.fix({
-                "y0": model.furman_np_y0,
-                "yc": model.furman_np_yc,
-            })
-            self.initial({
-                "b0": base_beta,
-                "b1": 0
-            })
-            self.bound({
-                "b0": (0, 2*base_beta),
-                "b1": (-base_beta, base_beta),
-            })
+                self.initial({
+                    "b0": 0.1,
+                    "b1": 0
+                })
+                self.bound({
+                    "b0": (0, np.inf),
+                    "b1": (-np.inf, np.inf),
+                })
         return Fit.fit(self, model, refit)
 
 class FurmanPhotoFit(Fit):
