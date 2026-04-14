@@ -97,3 +97,27 @@ def versus_plot(db: SimDB, paramA: str, paramB: str, colorBy: str | None = None,
         ax.set_title("{}({}){}".format(paramB, paramA, "by " + colorBy if not colorBy is None else ""))
 
     return (table[0][0], table[0][1]) if colorBy is None else (table[0][0], table[0][1], table[1][1])
+
+def histogram_plot(db: SimDB, param: str, bins: int | str = 'auto', 
+                   size: tuple[int, int] | None | Axes = (8, 6), 
+                   log_y: bool = False, color: str = 'C0', **restrict):
+    """
+    Produce a histogram of a specified parameter across the database, under restrict conditions.
+    """
+    ax = _axes(size)
+    # Extract the values for the requested parameter
+    results = db.where(**restrict)
+    values = [r[param] for r in results if param in r]
+    # Filter out non-numeric values or NaNs to prevent plotting errors
+    valid_values = [v for v in values if isinstance(v, (int, float, np.number)) and not (np.isnan(v) or np.isinf(v))]
+    if not valid_values:
+        ax.text(0.5, 0.5, f"No valid numeric data for {param}", ha='center', va='center')
+        return None
+    n, bins_out, patches = ax.hist(valid_values, bins=bins, color=color, edgecolor='black', alpha=0.7)
+    if log_y:
+        ax.set_yscale("log")
+    if not isinstance(size, Axes):
+        ax.set_xlabel(param)
+        ax.set_ylabel("Count")
+        ax.set_title(f"Histogram of {param}")
+    return n, bins_out, patches

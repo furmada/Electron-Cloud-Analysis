@@ -17,8 +17,8 @@ import numpy as np
 
 # Import your ECA modules
 try:
-    from eca import SimDB, ECModel, InstabilityModel, FurmanNoPhotoFit, FurmanPhotoFit, Fit, WhereIn
-    from ecaplots import model_plot, versus_plot
+    from eca import SimDB, ECModel, InstabilityModel, FurmanNoPhotoFit, FurmanPhotoFit, FurmanNPMCFit, Fit, WhereIn
+    from ecaplots import model_plot, versus_plot, histogram_plot
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
@@ -72,6 +72,53 @@ class ECAApp:
             else:
                 self.root.destroy()
                 sys.exit(0)
+
+    def _populate_filter_options(self):
+        """Populate the filter property dropdown with available properties."""
+        if not self.db:
+            return
+            
+        all_keys = self.db.all_keys()
+        total_count = len(self.db.where())
+        
+        valid_properties = []
+        for key in all_keys:
+            if key == 'path':
+                continue
+            unique_values = self.db.unique(key)
+            if len(unique_values) > 1 and len(unique_values) < total_count:
+                valid_properties.append(key)
+                
+        self.filter_property_combo['values'] = valid_properties
+
+    def _on_property_select(self, event=None):
+        """Populate the values listbox when a property is selected."""
+        if not self.db:
+            return
+            
+        prop = self.filter_property_var.get()
+        if not prop:
+            return
+            
+        # Get all unique values for this property from the database
+        all_values = set()
+        for doc in self.db.db.all():
+            if prop in doc:
+                val = doc[prop]
+                # TinyDB might return unhashable types like lists; handle them
+                if isinstance(val, list):
+                    all_values.add(tuple(val))
+                else:
+                    all_values.add(val)
+        
+        # Sort and store the mapping (string representation -> actual data)
+        sorted_vals = sorted(list(all_values), key=lambda x: str(x))
+        self.filter_val_map = {self._format_value(v): v for v in sorted_vals}
+        
+        # Update the Listbox display
+        self.filter_values_listbox.delete(0, tk.END)
+        for val_str in self.filter_val_map.keys():
+            self.filter_values_listbox.insert(tk.END, val_str)
 
     def _format_value(self, val: Any) -> str:
         """Format numbers consistently for display."""
@@ -131,6 +178,7 @@ class ECAApp:
         self._create_filter_tab()
         self._create_fitting_tab()
         self._create_plotting_tab()
+        self._create_histogram_tab()
         self._create_individual_plot_tab()
         
         # Status bar
@@ -257,6 +305,7 @@ class ECAApp:
         self._clear_filter_tab()
         self._clear_fitting_tab()
         self._clear_plotting_tab()
+        self._clear_histogram_tab()
         self._clear_individual_plot_tab()
         
     # ==================== OVERVIEW TAB ====================
@@ -358,35 +407,65 @@ class ECAApp:
     # ==================== FILTER TAB ====================
     
     def _create_filter_tab(self):
-        """Create the Filter tab."""
+        """Create the Filter tab with dynamic filtering support."""
         tab = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(tab, text="Filter")
         
+        # Mode Selection
+        mode_frame = ttk.Frame(tab)
+        mode_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        
+        ttk.Label(mode_frame, text="Filter Mode:").pack(side=tk.LEFT, padx=(0, 10))
+        self.filter_mode_var = tk.StringVar(value="exact")
+        ttk.Radiobutton(mode_frame, text="Exact Match", variable=self.filter_mode_var, value="exact", command=self._toggle_filter_mode).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(mode_frame, text="Condition (>, <, ==)", variable=self.filter_mode_var, value="condition", command=self._toggle_filter_mode).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(mode_frame, text="Custom Expression", variable=self.filter_mode_var, value="expression", command=self._toggle_filter_mode).pack(side=tk.LEFT, padx=5)
+        
         # Filter controls
         control_frame = ttk.LabelFrame(tab, text="Filter Criteria", padding="5")
-        control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        control_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         tab.columnconfigure(0, weight=1)
         
-        # Property selection
-        prop_frame = ttk.Frame(control_frame)
-        prop_frame.pack(fill=tk.X, pady=5)
+        # Top part of control frame: Property selection (Used by exact and condition)
+        self.prop_frame = ttk.Frame(control_frame)
+        self.prop_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Label(prop_frame, text="Property:").pack(side=tk.LEFT)
+        ttk.Label(self.prop_frame, text="Property:").pack(side=tk.LEFT)
         self.filter_property_var = tk.StringVar()
-        self.filter_property_combo = ttk.Combobox(prop_frame, textvariable=self.filter_property_var, state="readonly", width=30)
+        self.filter_property_combo = ttk.Combobox(self.prop_frame, textvariable=self.filter_property_var, state="readonly", width=30)
         self.filter_property_combo.pack(side=tk.LEFT, padx=5)
         self.filter_property_combo.bind("<<ComboboxSelected>>", self._on_property_select)
         
-        # Value selection
-        value_frame = ttk.Frame(control_frame)
-        value_frame.pack(fill=tk.X, pady=5)
+        # Container for dynamic inputs
+        self.input_container = ttk.Frame(control_frame)
+        self.input_container.pack(fill=tk.X, pady=5)
         
-        ttk.Label(value_frame, text="Values:").pack(side=tk.LEFT)
-        self.filter_values_listbox = tk.Listbox(value_frame, selectmode=tk.MULTIPLE, height=5, width=50)
+        # --- Exact Match UI ---
+        self.exact_frame = ttk.Frame(self.input_container)
+        ttk.Label(self.exact_frame, text="Values:").pack(side=tk.LEFT)
+        self.filter_values_listbox = tk.Listbox(self.exact_frame, selectmode=tk.MULTIPLE, height=5, width=50)
         self.filter_values_listbox.pack(side=tk.LEFT, padx=5)
-        value_scroll = ttk.Scrollbar(value_frame, orient=tk.VERTICAL, command=self.filter_values_listbox.yview)
+        value_scroll = ttk.Scrollbar(self.exact_frame, orient=tk.VERTICAL, command=self.filter_values_listbox.yview)
         self.filter_values_listbox.configure(yscrollcommand=value_scroll.set)
         value_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        
+        # --- Condition UI ---
+        self.condition_frame = ttk.Frame(self.input_container)
+        ttk.Label(self.condition_frame, text="Operator:").pack(side=tk.LEFT)
+        self.cond_op_var = tk.StringVar(value=">")
+        self.cond_op_combo = ttk.Combobox(self.condition_frame, textvariable=self.cond_op_var, state="readonly", width=5, values=[">", "<", ">=", "<=", "==", "!="])
+        self.cond_op_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(self.condition_frame, text="Value:").pack(side=tk.LEFT, padx=(10, 0))
+        self.cond_val_var = tk.StringVar()
+        ttk.Entry(self.condition_frame, textvariable=self.cond_val_var, width=20).pack(side=tk.LEFT, padx=5)
+        
+        # --- Expression UI ---
+        self.expression_frame = ttk.Frame(self.input_container)
+        ttk.Label(self.expression_frame, text="Expression:").pack(side=tk.LEFT)
+        self.expr_var = tk.StringVar()
+        ttk.Entry(self.expression_frame, textvariable=self.expr_var, width=50).pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.expression_frame, text="(e.g., Ne_0 > 1e10 and buildup == True)").pack(side=tk.LEFT, padx=5)
         
         # Add filter button
         add_filter_btn = ttk.Button(control_frame, text="Add Filter", command=self._add_filter)
@@ -394,15 +473,15 @@ class ECAApp:
         
         # Active filters display
         filters_frame = ttk.LabelFrame(tab, text="Active Filters", padding="5")
-        filters_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
-        tab.rowconfigure(1, weight=1)
+        filters_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+        tab.rowconfigure(2, weight=1)
         
         self.active_filters_text = scrolledtext.ScrolledText(filters_frame, height=8, wrap=tk.WORD)
         self.active_filters_text.pack(fill=tk.BOTH, expand=True)
         
         # Action buttons
         button_frame = ttk.Frame(tab)
-        button_frame.grid(row=2, column=0, pady=10)
+        button_frame.grid(row=3, column=0, pady=10)
         
         apply_filter_btn = ttk.Button(button_frame, text="Apply Filter", command=self._apply_filter)
         apply_filter_btn.pack(side=tk.LEFT, padx=5)
@@ -413,90 +492,149 @@ class ECAApp:
         reset_btn = ttk.Button(button_frame, text="Reset to Full Database", command=self._reset_filter)
         reset_btn.pack(side=tk.LEFT, padx=5)
         
-        # Temp window button
         temp_window_btn = ttk.Button(button_frame, text="New Temp. Window", command=self._open_temp_window)
         temp_window_btn.pack(side=tk.LEFT, padx=5)
         
-        # Store active filters locally
-        self.active_filters: Dict[str, List[Any]] = {}
+        # Store active filters locally as a list to support multiple rules
+        self.active_filters_list: List[Dict[str, Any]] = []
         self.filter_val_map = {}
         
-    def _populate_filter_options(self):
-        """Populate the filter property dropdown with available properties."""
-        if not self.db:
-            return
-            
-        all_keys = self.db.all_keys()
-        total_count = len(self.db.where())
+        # Initialize UI state
+        self._toggle_filter_mode()
+
+    def _toggle_filter_mode(self, *args):
+        """Toggle the visibility of input frames based on selected mode."""
+        mode = self.filter_mode_var.get()
         
-        valid_properties = []
-        for key in all_keys:
-            if key == 'path':
-                continue
-            unique_values = self.db.unique(key)
-            if len(unique_values) > 1 and len(unique_values) < total_count:
-                valid_properties.append(key)
-                
-        self.filter_property_combo['values'] = valid_properties
+        self.exact_frame.pack_forget()
+        self.condition_frame.pack_forget()
+        self.expression_frame.pack_forget()
         
-    def _on_property_select(self, event=None):
-        """Handle property selection in filter tab."""
-        property_name = self.filter_property_var.get()
-        if not property_name or not self.db:
-            return
-            
-        self.filter_values_listbox.delete(0, tk.END)
-        self.filter_val_map = {} # Reset the map for the new property
-        
-        unique_values = self.db.unique(property_name)
-        for value in unique_values:
-            fmt_val = self._format_value(value)
-            
-            # Handle potential string collisions
-            while fmt_val in self.filter_val_map and self.filter_val_map[fmt_val] != value:
-                fmt_val += " " 
-                
-            self.filter_val_map[fmt_val] = value
-            self.filter_values_listbox.insert(tk.END, fmt_val)
+        if mode == "exact":
+            self.prop_frame.pack(fill=tk.X, pady=5, before=self.input_container)
+            self.exact_frame.pack(fill=tk.X)
+        elif mode == "condition":
+            self.prop_frame.pack(fill=tk.X, pady=5, before=self.input_container)
+            self.condition_frame.pack(fill=tk.X)
+        elif mode == "expression":
+            self.prop_frame.pack_forget() # Not needed for general expression
+            self.expression_frame.pack(fill=tk.X)
 
     def _add_filter(self):
-        """Add a filter criterion."""
-        property_name = self.filter_property_var.get()
-        if not property_name:
-            messagebox.showwarning("Warning", "Please select a property to filter on")
-            return
+        """Add a filter criterion based on current mode."""
+        mode = self.filter_mode_var.get()
+        
+        if mode == "exact":
+            prop = self.filter_property_var.get()
+            if not prop:
+                messagebox.showwarning("Warning", "Please select a property to filter on")
+                return
+                
+            selected_indices = self.filter_values_listbox.curselection()
+            if not selected_indices:
+                messagebox.showwarning("Warning", "Please select at least one value")
+                return
+                
+            selected_strings = [self.filter_values_listbox.get(i) for i in selected_indices]
+            exact_values = [self.filter_val_map[val_str] for val_str in selected_strings]
             
-        selected_indices = self.filter_values_listbox.curselection()
-        if not selected_indices:
-            messagebox.showwarning("Warning", "Please select at least one value")
-            return
+            # Group exact filters by property
+            found = False
+            for f in self.active_filters_list:
+                if f["type"] == "exact" and f["property"] == prop:
+                    f["values"].extend(exact_values)
+                    f["values"] = list(set(f["values"]))
+                    found = True
+                    break
+            if not found:
+                self.active_filters_list.append({"type": "exact", "property": prop, "values": exact_values})
+                
+        elif mode == "condition":
+            prop = self.filter_property_var.get()
+            if not prop:
+                messagebox.showwarning("Warning", "Please select a property for the condition")
+                return
             
-        # Get exact original values
-        selected_strings = [self.filter_values_listbox.get(i) for i in selected_indices]
-        exact_values = [self.filter_val_map[val_str] for val_str in selected_strings]
-                    
-        self.active_filters[property_name] = exact_values
+            op = self.cond_op_var.get()
+            val_str = self.cond_val_var.get().strip()
+            if not val_str:
+                messagebox.showwarning("Warning", "Please provide a value for the condition")
+                return
+                
+            try:
+                # Try to parse as a numeric
+                val = float(val_str)
+                if val.is_integer(): val = int(val)
+            except ValueError:
+                val = val_str # Fallback to string matching
+                
+            self.active_filters_list.append({"type": "condition", "property": prop, "operator": op, "value": val})
+            
+        elif mode == "expression":
+            expr = self.expr_var.get().strip()
+            if not expr:
+                messagebox.showwarning("Warning", "Please enter an expression")
+                return
+                
+            self.active_filters_list.append({"type": "expression", "expr": expr})
+            
         self._update_active_filters_display()
         
     def _update_active_filters_display(self):
-        """Update the active filters display."""
+        """Update the active filters display text box."""
         self.active_filters_text.delete(1.0, tk.END)
-        if not self.active_filters:
+        if not self.active_filters_list:
             self.active_filters_text.insert(tk.END, "No active filters\n")
             return
             
         self.active_filters_text.insert(tk.END, "Active Filters:\n")
         self.active_filters_text.insert(tk.END, "-" * 30 + "\n")
         
-        for prop, values in self.active_filters.items():
-            formatted_vals = [self._format_value(v) for v in values]
-            self.active_filters_text.insert(tk.END, f"{prop}: {', '.join(formatted_vals)}\n")
-            
+        for i, f_data in enumerate(self.active_filters_list):
+            if f_data["type"] == "exact":
+                formatted_vals = [self._format_value(v) for v in f_data["values"]]
+                self.active_filters_text.insert(tk.END, f"[{i+1}] Exact: {f_data['property']} in ({', '.join(formatted_vals)})\n")
+            elif f_data["type"] == "condition":
+                val_fmt = f"'{f_data['value']}'" if isinstance(f_data['value'], str) else f_data['value']
+                self.active_filters_text.insert(tk.END, f"[{i+1}] Condition: {f_data['property']} {f_data['operator']} {val_fmt}\n")
+            elif f_data["type"] == "expression":
+                self.active_filters_text.insert(tk.END, f"[{i+1}] Expression: {f_data['expr']}\n")
+                
     def _build_search_criteria(self):
-        """Build the query dictionary from active filters."""
+        """Build the query dictionary from active filters, compatible with eca.py's where()."""
         self.search_criteria = {}
-        for prop, values in self.active_filters.items():
-            self.search_criteria[prop] = WhereIn(*values)
+        for i, f_data in enumerate(self.active_filters_list):
+            if f_data["type"] == "exact":
+                self.search_criteria[f_data["property"]] = WhereIn(*f_data["values"])
+                
+            elif f_data["type"] == "condition":
+                prop = f_data["property"]
+                op = f_data["operator"]
+                val = f_data["value"]
+                
+                # Factory isolated to prevent late-binding Python loop issues
+                def build_callable(p, o, v):
+                    def cond_fn(result):
+                        if p not in result: return False
+                        res_val = result[p]
+                        try:
+                            if o == ">": return res_val > v
+                            if o == "<": return res_val < v
+                            if o == ">=": return res_val >= v
+                            if o == "<=": return res_val <= v
+                            if o == "==": return res_val == v
+                            if o == "!=": return res_val != v
+                        except TypeError:
+                            return False # Usually handles string/int comparison failures
+                        return False
+                    return cond_fn
+                
+                # Assign with a leading underscore so ECA evaluates it as a Callable(result)
+                self.search_criteria[f"_cond_{i}"] = build_callable(prop, op, val)
+                
+            elif f_data["type"] == "expression":
+                # Using a leading underscore makes ECA run eval() natively inside the result scope
+                self.search_criteria[f"_expr_{i}"] = f_data["expr"]
 
     def _apply_filter(self):
         """Update the global search criteria used across the application."""
@@ -504,19 +642,16 @@ class ECAApp:
             messagebox.showwarning("Warning", "No database loaded")
             return
             
-        if not self.active_filters:
+        if not self.active_filters_list:
             messagebox.showwarning("Warning", "No filters defined")
             return
             
         try:
-            # Build search arguments
             self._build_search_criteria()
             
-            # Re-initialize models directly on the master DB for fitting tracking
             filtered_sims = self.db.where(**self.search_criteria)
             self.current_models = [ECModel(self.db.db, doc) for doc in filtered_sims]
             
-            # Sync downstream views
             self._update_overview_tab()
             self._update_individual_sim_list()
             
@@ -525,54 +660,62 @@ class ECAApp:
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to apply filter: {str(e)}")
-            
-    def _open_temp_window(self):
-        """Extract a sub-database matching filters and open it in a new window."""
-        if not self.db:
-            messagebox.showwarning("Warning", "No database loaded")
-            return
-
-        self._build_search_criteria()
-        if not self.search_criteria:
-            messagebox.showinfo("Info", "No filters applied. The temporary window will contain a copy of the entire database.")
-
-        try:
-            # Extract to an independent, in-memory TinyDB
-            all_keys = self.db.all_keys()
-            temp_db = self.db.extract(all_keys, **self.search_criteria)
-            
-            # Launch new App bound to a Toplevel
-            new_root = tk.Toplevel(self.root)
-            ECAApp(new_root, db=temp_db, is_temp=True)
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to create temporary window: {str(e)}")
 
     def _clear_filters(self):
         """Clear all active filters from UI."""
-        self.active_filters.clear()
+        self.active_filters_list.clear()
         self._update_active_filters_display()
         self._update_status("Filters cleared")
-        
-    def _reset_filter(self):
-        """Reset the search criteria so all queries target the full database."""
-        self.search_criteria = {}
-        self._clear_filters()
-        
-        if self.db:
-            self.current_models = [ECModel(self.db.db, doc) for doc in self.db.where()]
-            self._update_overview_tab()
-            self._update_individual_sim_list()
-            self._update_status("Reset to full database")
         
     def _clear_filter_tab(self):
         """Clear the filter tab entirely."""
         self.search_criteria.clear()
-        self.active_filters.clear()
+        self.active_filters_list.clear()
         self._update_active_filters_display()
         self.filter_property_var.set("")
         self.filter_values_listbox.delete(0, tk.END)
+        self.cond_val_var.set("")
+        self.expr_var.set("")
         
+    def _reset_filter(self):
+        """Reset the search criteria and reload the full database."""
+        if not self.db:
+            return
+            
+        self._clear_filters()
+        self.search_criteria = {}
+        
+        # Reload all models from the full database
+        self.current_models = [ECModel(self.db.db, doc) for doc in self.db.db.all()]
+        
+        # Refresh the UI
+        self._update_overview_tab()
+        self._update_individual_sim_list()
+        
+        self._update_status("Database reset to full dataset.")
+        messagebox.showinfo("Reset", "Filters cleared. Showing all simulations.")
+
+    def _open_temp_window(self):
+        """Open a new GUI window containing only the currently filtered results."""
+        if not self.current_models:
+            messagebox.showwarning("Warning", "No simulations to display in a new window.")
+            return
+            
+        # Create a new top-level window
+        new_window = tk.Toplevel(self.root)
+        
+        # Initialize a new instance of ECAApp in the new window
+        # We pass the current db and set is_temp=True
+        new_app = ECAApp(new_window, db=self.db, is_temp=True)
+        
+        # Override the new app's models with our currently filtered subset
+        new_app.current_models = self.current_models.copy()
+        
+        # Update the new window's UI to reflect the subset
+        new_app._update_overview_tab()
+        new_app._update_individual_sim_list()
+        new_app._update_status(f"Initialized with {len(self.current_models)} simulations.")
+
     # ==================== FITTING TAB ====================
     
     def _create_fitting_tab(self):
@@ -588,7 +731,7 @@ class ECAApp:
         ttk.Label(model_frame, text="Select Fit Model:").pack(side=tk.LEFT)
         self.fit_model_var = tk.StringVar(value="FurmanNoPhoto")
         self.fit_model_combo = ttk.Combobox(model_frame, textvariable=self.fit_model_var, state="readonly", width=30)
-        self.fit_model_combo['values'] = ["FurmanNoPhoto", "FurmanPhoto"]
+        self.fit_model_combo['values'] = ["FurmanNoPhoto", "FurmanNPMC", "FurmanPhoto"]
         self.fit_model_combo.pack(side=tk.LEFT, padx=5)
         
         # Selection options
@@ -656,9 +799,10 @@ class ECAApp:
         #try:
         if model_name == "FurmanNoPhoto":
             fit = FurmanNoPhotoFit()
+        elif model_name == "FurmanNPMC":
+            fit = FurmanNPMCFit(self.db) # Injection here
         elif model_name == "FurmanPhoto":
             fit = FurmanPhotoFit()
-        else:
             messagebox.showerror("Error", f"Unknown fit model: {model_name}")
             return
             
@@ -807,6 +951,8 @@ class ECAApp:
         self.plot_x_combo['values'] = plotable_props
         self.plot_y_combo['values'] = plotable_props
         self.plot_color_combo['values'] = ["None"] + plotable_props
+        if hasattr(self, 'hist_prop_combo'):
+            self.hist_prop_combo['values'] = plotable_props
         
     def _generate_plot(self):
         """Generate a plot using the ecaplots.versus_plot utility."""
@@ -856,6 +1002,101 @@ class ECAApp:
         self.plot_x_var.set("")
         self.plot_y_var.set("")
         self.plot_color_var.set("None")
+    
+    # ==================== HISTOGRAM TAB ====================
+
+    def _create_histogram_tab(self):
+        """Create the Histogram tab for database-wide distributions."""
+        tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(tab, text="Histogram Plots")
+        
+        # Control panel
+        control_frame = ttk.LabelFrame(tab, text="Plot Controls", padding="5")
+        control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        tab.columnconfigure(0, weight=1)
+        
+        # Settings frame
+        settings_frame = ttk.Frame(control_frame)
+        settings_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(settings_frame, text="Property:").pack(side=tk.LEFT)
+        self.hist_prop_var = tk.StringVar()
+        self.hist_prop_combo = ttk.Combobox(settings_frame, textvariable=self.hist_prop_var, state="readonly", width=20)
+        self.hist_prop_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(settings_frame, text="Bins:").pack(side=tk.LEFT, padx=(10, 0))
+        self.hist_bins_var = tk.StringVar(value="auto")
+        self.hist_bins_entry = ttk.Entry(settings_frame, textvariable=self.hist_bins_var, width=10)
+        self.hist_bins_entry.pack(side=tk.LEFT, padx=5)
+        
+        self.hist_log_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(settings_frame, text="Log Y-axis", variable=self.hist_log_var).pack(side=tk.LEFT, padx=10)
+        
+        # Plot button
+        plot_btn = ttk.Button(control_frame, text="Generate Histogram", command=self._generate_histogram)
+        plot_btn.pack(pady=10)
+        
+        # Plot display area
+        plot_frame = ttk.LabelFrame(tab, text="Plot", padding="5")
+        plot_frame.grid(row=1, column=0, sticky="nsew")
+        tab.rowconfigure(1, weight=1)
+        
+        # Matplotlib figure
+        self.hist_fig = Figure(figsize=(8, 6), dpi=100)
+        self.hist_canvas = FigureCanvasTkAgg(self.hist_fig, master=plot_frame)
+        self.hist_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Toolbar
+        toolbar = NavigationToolbar2Tk(self.hist_canvas, plot_frame)
+        toolbar.update()
+
+    def _generate_histogram(self):
+        """Generate a histogram using the ecaplots.histogram_plot utility."""
+        if not self.db:
+            messagebox.showwarning("Warning", "No database loaded")
+            return
+            
+        prop = self.hist_prop_var.get()
+        if not prop:
+            messagebox.showwarning("Warning", "Please select a property")
+            return
+            
+        # Parse bins parameter
+        bins_val = self.hist_bins_var.get().strip()
+        if bins_val.lower() != 'auto':
+            try:
+                bins_val = int(bins_val)
+                if bins_val <= 0: raise ValueError
+            except ValueError:
+                messagebox.showwarning("Warning", "Bins must be 'auto' or a positive integer.")
+                return
+                
+        try:
+            self.hist_fig.clear()
+            ax = self.hist_fig.add_subplot(111)
+            
+            # Apply active filters
+            if self.search_criteria:
+                db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria)
+            else:
+                db_to_use = self.db
+            
+            histogram_plot(db_to_use, prop, bins=bins_val, log_y=self.hist_log_var.get(), size=ax)
+            
+            self.hist_canvas.draw()
+            self._update_status(f"Histogram generated: {prop}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Histogram generation failed: {str(e)}")
+            self._update_status("Histogram generation failed")
+
+    def _clear_histogram_tab(self):
+        """Clear the histogram tab."""
+        self.hist_fig.clear()
+        self.hist_canvas.draw()
+        self.hist_prop_var.set("")
+        self.hist_bins_var.set("auto")
+        self.hist_log_var.set(False)
         
     # ==================== INDIVIDUAL PLOT TAB ====================
     
@@ -910,7 +1151,7 @@ class ECAApp:
         self.individual_fit_var = tk.StringVar(value="None")
         ttk.Label(fit_frame, text="Apply Fit:").pack(side=tk.LEFT)
         self.individual_fit_combo = ttk.Combobox(fit_frame, textvariable=self.individual_fit_var, state="readonly", width=20)
-        self.individual_fit_combo['values'] = ["None", "FurmanNoPhoto", "FurmanPhoto"]
+        self.individual_fit_combo['values'] = ["None", "FurmanNoPhoto", "FurmanNPMC", "FurmanPhoto"]
         self.individual_fit_combo.pack(side=tk.LEFT, padx=5)
         
         self.individual_central_density_var = tk.BooleanVar(value=False)
@@ -987,19 +1228,10 @@ class ECAApp:
         if not selections or not self.db:
             return
             
-        # Clear previous plot
         self.individual_fig.clear()
         ax = self.individual_fig.add_subplot(111)
         
-        # Get fit model if selected
         fit_model_name = self.individual_fit_var.get()
-        fit_classes = []
-        if fit_model_name != "None":
-            if fit_model_name == "FurmanNoPhoto":
-                fit_classes.append(FurmanNoPhotoFit)
-            elif fit_model_name == "FurmanPhoto":
-                fit_classes.append(FurmanPhotoFit)
-                
         plotted_count = 0
         
         for idx, selection in enumerate(selections):
@@ -1010,11 +1242,18 @@ class ECAApp:
             except (ValueError, IndexError):
                 continue
                 
-            # Initialize model directly from the main database
             model = ECModel(self.db.db, doc_id)
             path_exists = os.path.exists(model.path) and os.path.exists(os.path.join(model.path, "Pyecltest.mat"))
             
-            fits_to_plot = [FitClass() for FitClass in fit_classes]
+            # Dynamically instantiate the required fit object for this simulation
+            fits_to_plot = []
+            if fit_model_name != "None":
+                if fit_model_name == "FurmanNoPhoto":
+                    fits_to_plot.append(FurmanNoPhotoFit())
+                elif fit_model_name == "FurmanNPMC":
+                    fits_to_plot.append(FurmanNPMCFit(self.db)) # DB injected per sim
+                elif fit_model_name == "FurmanPhoto":
+                    fits_to_plot.append(FurmanPhotoFit())
 
             if not path_exists and not fits_to_plot:
                 continue

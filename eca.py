@@ -448,6 +448,8 @@ class WhereIn(object):
     
     def query(self, value, _):
         # First try exact match
+        if isinstance(value, list) or isinstance(value, np.ndarray):
+            value = tuple(value)
         if value in self.match:
             return True
         # Try numeric equivalence (handles int vs float vs numpy types)
@@ -927,10 +929,9 @@ class Fit(object):
         elif len(ydata) <= 5:
             return ydata[-1]
         smooth_diff = smooth(np.diff(ydata), max(ydata.size // 10, 5))
-        where_max = np.argmax(smooth_diff)
-        if where_max > smooth_diff.size / 2:
+        if np.mean(smooth_diff[-max(ydata.size // 10, 5):]) >= ydata[-1]*1e-3:
             # We have likely not completed the buildup within the simulation window
-            return  (3 + (where_max / smooth_diff.size))*np.max(ydata)
+            return  (3 + (np.argmax(smooth_diff) / smooth_diff.size))*np.max(ydata)
         else:
             # Return an estimate based on the average slope in the last window
             return min(np.mean(ydata[-5:-1]) + max(np.mean(smooth_diff[-max(ydata.size // 10, 5):]), 0), np.max(ydata))
@@ -1119,6 +1120,69 @@ class FurmanNoPhotoFit(Fit):
         self.bound(bounds)
         return super().fit(model, refit)
 
+class FurmanNPMCFit(FurmanNoPhotoFit):
+    """
+    "FURMAN" NO PHOTOEMISSION MODEL WITH MAGNETIC CORRECTION
+    x  -> scaled time
+    yc -> Critical electron cloud density
+    b0 -> Furman beta parameter (multipacting)
+    b1 -> Magnetic correction
+    y0 -> [fixed] initial value = initial e- concentration
+
+    Solves the modified ODE dy/dx = (0) + (b0 + b1*x) * (yc - y(x)) * y(x)
+    """
+
+    FURMAN_NO_PHOTO_MC = "(y0 * yc * np.exp(yc*x*(b0 + 0.5*b1*x))) / (yc + y0 * (np.exp(yc*x*(b0 + 0.5*b1*x)) - 1))"
+
+    def __init__(self, db: SimDB, selector: None | DataSelector = None):
+        self.db = db
+        Fit.__init__(self,
+            "furman_npmc",
+            FurmanNPMCFit.FURMAN_NO_PHOTO_MC,
+            ("x", "yc", "b0", "b1", "y0"),
+            BunchAverageSelector() if selector is None else selector
+        )
+    
+    def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
+        np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
+        if np_result is None:
+            self._mset("success", False, model)
+            setattr(model, "_"+self.name+"_fitting_error", "The underlying NoPhoto fit failed.")
+            return None
+        if list(model.B_multip) == [0]:
+            self.fix({
+                "y0": model.furman_np_y0,
+                "yc": model.furman_np_yc,
+                "b1": 0,
+            })
+            self.bound({"b0": (-2*abs(model.furman_np_beta), 2*abs(model.furman_np_beta))})
+            self.initial({"b0": model.furman_np_beta})
+        else:
+            base_search = self.db.where(doc_id=model.doc_id)[0]
+            base_model = self.db.closest(base_search, photoemission=False, furman_np_success=True, B_multip=[0])
+            if len(base_model) == 0:
+                self._mset("success", False, model)
+                setattr(model, "_"+self.name+"_fitting_error", "A base model with B=[0] was not found.")
+                return None
+            base_model = ECModel(model.db, base_model[0])
+            if base_model.furman_np_beta > 0:
+                base_beta = base_model.furman_np_beta
+            else:
+                base_beta = (model.furman_np_beta / 2)
+            self.fix({
+                "y0": model.furman_np_y0,
+                "yc": model.furman_np_yc,
+            })
+            self.initial({
+                "b0": base_beta,
+                "b1": 0
+            })
+            self.bound({
+                "b0": (0, 2*base_beta),
+                "b1": (-base_beta, base_beta),
+            })
+        return Fit.fit(self, model, refit)
+
 class FurmanPhotoFit(Fit):
     """
     "FURMAN" FULL MODEL (B) - NO PHOTOEMISSION
@@ -1151,17 +1215,6 @@ class FurmanPhotoFit(Fit):
         _, scale_y = self.scale_factor(model, xdata, ydata)
         self.fix({"y0": model.Ne_0 * scale_y})
         if model.buildup:
-            # mslope = np.argmin(np.square(ydata - (ydata[-1]/2)))
-            # bounds = {
-            #     "yc": (model.Ne_0 * scale_y, 2*self.limit_estimate(xdata, ydata)*scale_y),
-            #     "alpha": (0, 2*model.k_pe_st*scipy.constants.c*model.b_spac),
-            #     "beta": (0, np.inf)
-            # }
-            # self.initial({
-            #     "yc": self.limit_estimate(xdata, ydata)*scale_y,
-            #     "alpha": model.k_pe_st*scipy.constants.c*model.b_spac,
-            #     "beta": min(1, abs(4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)))
-            # })
             np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
             if np_result is None:
                 self._mset("success", False, model)
