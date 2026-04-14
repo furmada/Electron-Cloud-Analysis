@@ -1032,14 +1032,19 @@ class ECAApp:
         right_frame = ttk.Frame(tab)
         right_frame.grid(row=0, column=1, sticky="nsew")
         tab.columnconfigure(1, weight=1)
+        right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(1, weight=1)
         
         fit_frame = ttk.LabelFrame(right_frame, text="Plot Configuration", padding="5")
         fit_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         
-        ttk.Label(fit_frame, text="Apply Fit:").pack(side=tk.LEFT)
-        self.individual_fit_var = tk.StringVar(value="None")
-        ttk.Combobox(fit_frame, textvariable=self.individual_fit_var, state="readonly", width=20,
-                     values=["None"] + list(self.FIT_MODELS.keys())).pack(side=tk.LEFT, padx=5)
+        ttk.Label(fit_frame, text="Apply Fits:").pack(side=tk.LEFT)
+        
+        self.individual_fit_vars = {}
+        for fit_name in self.FIT_MODELS.keys():
+            var = tk.BooleanVar(value=False)
+            self.individual_fit_vars[fit_name] = var
+            ttk.Checkbutton(fit_frame, text=fit_name, variable=var).pack(side=tk.LEFT, padx=5)
         
         self.individual_central_density_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(fit_frame, text="Use Central Density", variable=self.individual_central_density_var).pack(side=tk.LEFT, padx=10)
@@ -1051,7 +1056,6 @@ class ECAApp:
         
         plot_frame = ttk.LabelFrame(right_frame, text="Simulation Plot", padding="5")
         plot_frame.grid(row=1, column=0, sticky="nsew")
-        right_frame.rowconfigure(1, weight=1)
         
         self.individual_fig = Figure(figsize=(10, 6), dpi=100)
         self.individual_canvas = FigureCanvasTkAgg(self.individual_fig, master=plot_frame)
@@ -1102,7 +1106,8 @@ class ECAApp:
         self.individual_fig.clear()
         ax = self.individual_fig.add_subplot(111)
         
-        fit_model_name = self.individual_fit_var.get()
+        # Collect selected fit models
+        selected_fits = [name for name, var in self.individual_fit_vars.items() if var.get()]
         plotted_count = 0
         
         for selection in selections:
@@ -1116,7 +1121,7 @@ class ECAApp:
             path_exists = os.path.exists(model.path) and os.path.exists(os.path.join(model.path, "Pyecltest.mat"))
             
             fits_to_plot = []
-            if fit_model_name != "None":
+            for fit_model_name in selected_fits:
                 fit_class = self.FIT_MODELS.get(fit_model_name)
                 if fit_class:
                     fits_to_plot.append(fit_class(self.db) if fit_model_name == "FurmanNPMC" else fit_class())
@@ -1135,7 +1140,7 @@ class ECAApp:
                 fit_max_x = 300.0
             
             model_plot(model=model, fits=fits_to_plot, size=ax, show_error=True, 
-                      central_density=cd_param, fit_maxX=fit_max_x, label=str(doc_id))
+                    central_density=cd_param, fit_maxX=fit_max_x, label=str(doc_id))
             plotted_count += 1
         
         if plotted_count > 0:
