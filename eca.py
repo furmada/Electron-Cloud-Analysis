@@ -26,7 +26,7 @@ class DBFolder(object):
     -> shared_properties are meta-attributes that all simulations found
         within this DBFolder will inherit.
     """
-    FILENAMES = {
+    FILENAMES: dict[str, str] = {
         "data":       "Pyecltest.mat",
         "sey":        "secondary_emission_parameters.input",
         "machine":    "machine_parameters.input",
@@ -66,7 +66,7 @@ class InstabilityDBFolder(DBFolder):
         within this DBFolder will inherit.
     """
     CONFIG_FOLDER = "pyecloud_config"
-    FILENAMES = {
+    FILENAMES: dict[str, str] = {
         "sey":        "secondary_emission_parameters.input",
         "machine":    "machine_parameters.input",
         "simulation": "simulation_parameters.input"
@@ -351,7 +351,7 @@ class SimDB(object):
         else: 
             return list(sorted(set(values)))
 
-    def closest(self, entry: dict, **search) -> list[dict]:
+    def closest(self, entry: dict, **search) -> list[Document]:
         """
         Finds the entries in the database which matches the greatest number of properties with "entry".
         """
@@ -448,7 +448,7 @@ class WhereIn(object):
         if str_match:
             self.match_str = {str(item) for item in items}
     
-    def query(self, value, _):
+    def query(self, value, _) -> bool:
         # First try exact match
         if isinstance(value, list) or isinstance(value, np.ndarray):
             value = tuple(value)
@@ -472,7 +472,7 @@ class WhereNot(WhereIn):
     """
     Inverts the query.
     """
-    def query(self, value, _):
+    def query(self, value, _) -> bool:
         return not super().query(value, _)
 
 
@@ -593,7 +593,7 @@ class ECModel(SynchedEntry):
     """
     An ECModel corresponds to the analysis of one PyECloud data file.
     """
-    PROPERTIES = {
+    PROPERTIES: set[str] = {
         "area",             # The area of the beam chamber
         "buildup",          # True if there is multipacting buildup of EC
         "bunch_step",       # The number of indexes corresponding to b_spac
@@ -763,7 +763,7 @@ class InstabilityModel(SynchedEntry):
     """
     An InstabilityModel corresponds to one PyHEADTAIL instability simulation.
     """
-    PROPERTIES = {
+    PROPERTIES: set[str] = {
         "data_files",       # Map of data contained in .h5 files: {filename: {propA: n.entries, propB: {subpropA: n.entries}}}
         "bunch_data_file",   # The data file where bunch evolution is stored
         "slice_data_file"   # The data file where slice evolution is stored

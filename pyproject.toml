@@ -5,7 +5,7 @@ description = "Electron Cloud Analysis (EcA) - A tool for analyzing electron clo
 authors = [
     {name = "Adam Furman", email = "adam.furman@cern.ch"},
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "GPLV3"}
 classifiers = [
     "Programming Language :: Python :: 3",
