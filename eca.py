@@ -603,7 +603,8 @@ class ECModel(SynchedEntry):
         "magnet",           # The type of magnetic section (0: drift, 2: dipole, 4: quadrupole, 6: sextupole)
         "mean_intensity",   # The mean beam intensity
         "Ne_0",             # Initial number of electrons
-        "perimeter"         # The perimeter of the beam chamber
+        "perimeter",        # The perimeter of the beam chamber
+        "train_times"      # Times of the start of each bunch train
     }
 
     def __init__(self, db: TinyDB | SimDB, doc: int | Document):
@@ -678,6 +679,21 @@ class ECModel(SynchedEntry):
         """
         return np.floor(t / (self.time[1] - self.time[0])).astype(int)
 
+    def train_to_index(self, train: int | np.integer) -> np.ndarray:
+        """
+        Convert a train number to its corresponding time indexes in the time array.
+        """
+        if train < 0:
+            train = len(self.train_times) + train
+        return np.arange(int(self.time_to_index(self.train_times[train])), int(self.time_to_index(self.train_times[train+1]) if train < len(self.train_times) - 1 else self.cutoff))
+
+    def train_to_bunches(self, train: int | np.integer) -> np.ndarray:
+        """
+        Convert a train number to its corresponding bunch passage indexes.
+        """
+        train_lengths = np.diff(self.train_times, append=self.time[self.cutoff])
+        return np.argwhere(np.bitwise_and(self.bunch_times >= self.train_times[train], self.bunch_times < self.train_times[train] + train_lengths[train])).ravel().astype(int)
+
     def gen_area(self):
         """
         Calculates the area of the beam chamber.
@@ -700,7 +716,7 @@ class ECModel(SynchedEntry):
         """
         The times corresponding to maximum beam intensity.
         """
-        self.bunch_times = self.t_offs + (self.b_spac * np.arange(np.argwhere(self.filling_pattern_file == 1).ravel()[-1]))
+        self.bunch_times = self.t_offs + (self.b_spac * np.argwhere(self.filling_pattern_file == 1).ravel())
 
     def gen_cutoff(self):
         """
@@ -758,6 +774,13 @@ class ECModel(SynchedEntry):
         self.area = 0.5 * np.abs(
             np.sum(Vx[:-1] * Vy[1:] - Vx[1:] * Vy[:-1])
         )
+
+    def gen_train_times(self):
+        """
+        The times of each bunch train.
+        """
+        where_gaps = np.argwhere(np.diff(self.bunch_times, prepend=self.t_offs) > self.b_spac + self.t_offs).ravel()
+        self.train_times = np.concat((np.array([self.bunch_times[0]]), self.bunch_times[where_gaps]), axis=None)
 
 class InstabilityModel(SynchedEntry):
     """
@@ -852,30 +875,30 @@ class DataSelector(object):
     """
     A DataSelector chooses data for fitting or other analysis from an ECModel.
     """
-    def __init__(self, use_central_density: bool = False):
+    def __init__(self, use_central_density: bool = False, use_train: int = -1):
         self.use_central_density = use_central_density
+        self.use_train = use_train
 
     def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        return (model.time, model.central_density if self.use_central_density else model.N_electrons)
+        train = model.train_to_index(self.use_train)
+        return (model.time[train], model.central_density[train] if self.use_central_density else model.N_electrons[train])
 
 class BeforeBunchSelector(DataSelector):
     """
     Selects the points immediately before each bunch passage as the fitting points.
     """
     def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        pre_bp = np.array(model.time_to_index(model.bunch_times - model.half_bunch))
-        valid = pre_bp < model.time.size
-        return (model.time[pre_bp[valid]],
-                (model.central_density if self.use_central_density else model.N_electrons)[pre_bp[valid]])
+        pre_bp = np.array(model.time_to_index(model.bunch_times[model.train_to_bunches(self.use_train)] - model.half_bunch))
+        return (model.time[pre_bp],
+                (model.central_density if self.use_central_density else model.N_electrons)[pre_bp])
 
 class BunchAverageSelector(DataSelector):
     """
     Selects the points immediately before each bunch passage as the fitting points.
     """
     def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        pre_bp = np.array(model.time_to_index(model.bunch_times - model.half_bunch))
-        valid = pre_bp < model.time.size
-        pre_bp = pre_bp[valid]
+        valid = model.train_to_bunches(self.use_train)
+        pre_bp = np.array(model.time_to_index(model.bunch_times[valid] - model.half_bunch))
         averages = np.zeros_like(pre_bp)
         for b, start in enumerate(pre_bp):
             averages[b] = np.mean(
@@ -1026,6 +1049,7 @@ class Fit(object):
                         self._mset(v+"_err", perr[f], model)
                         f += 1
                 self._mset("success", True, model)
+                self._mset("train", self.selector.use_train, model)
                 if hasattr(model, "_data"): delattr(model, "_data")
                 if hasattr(model, "_smooth"): delattr(model, "_smooth")
                 if hasattr(model, "_smooth_diff"): delattr(model, "_smooth_diff")
