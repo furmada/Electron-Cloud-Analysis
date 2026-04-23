@@ -15,7 +15,7 @@ import numpy as np
 from collections import defaultdict
 
 try:
-    from eca import SimDB, ECModel, InstabilityModel, FurmanNoPhotoFit, FurmanPhotoFit, FurmanNPMCFit, Fit, WhereIn
+    from eca import SimDB, ECModel, InstabilityModel, FurmanNoPhotoFit, FurmanPhotoFit, FurmanNPMCFit, Fit, WhereIn, BeforeBunchSelector, BunchAverageSelector
     from ecaplots import model_plot, versus_plot, histogram_plot
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -733,10 +733,25 @@ class ECAApp:
         self.fit_model_var = tk.StringVar(value="FurmanNoPhoto")
         ttk.Combobox(model_frame, textvariable=self.fit_model_var, state="readonly", width=30,
                      values=list(self.FIT_MODELS.keys())).pack(side=tk.LEFT, padx=5)
+
+        selector_frame = ttk.LabelFrame(tab, text="Data Selection", padding="5")
+        selector_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        
+        ttk.Label(selector_frame, text="Selector:").pack(side=tk.LEFT)
+        self.fit_selector_var = tk.StringVar(value="BunchAverage")
+        ttk.Combobox(selector_frame, textvariable=self.fit_selector_var, state="readonly", width=15,
+                     values=["BunchAverage", "BeforeBunch"]).pack(side=tk.LEFT, padx=5)
+                     
+        self.fit_central_density_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(selector_frame, text="Use Central Density", variable=self.fit_central_density_var).pack(side=tk.LEFT, padx=10)
+        
+        ttk.Label(selector_frame, text="Train:").pack(side=tk.LEFT)
+        self.fit_train_var = tk.StringVar(value="-1")
+        ttk.Entry(selector_frame, textvariable=self.fit_train_var, width=5).pack(side=tk.LEFT, padx=2)
         
         selection_frame = ttk.LabelFrame(tab, text="Selection", padding="5")
-        selection_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
-        tab.rowconfigure(1, weight=1)
+        selection_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+        tab.rowconfigure(2, weight=0)
         
         self.selection_mode = tk.StringVar(value="filtered")
         ttk.Radiobutton(selection_frame, text="Use Filtered Simulations", 
@@ -745,18 +760,18 @@ class ECAApp:
                        variable=self.selection_mode, value="all").pack(anchor=tk.W)
         
         progress_frame = ttk.LabelFrame(tab, text="Progress", padding="5")
-        progress_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        progress_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         self.progress_var = tk.StringVar(value="Ready")
         ttk.Label(progress_frame, textvariable=self.progress_var).pack(fill=tk.X)
         
         button_frame = ttk.Frame(tab)
-        button_frame.grid(row=3, column=0, pady=10)
+        button_frame.grid(row=4, column=0, pady=10)
         ttk.Button(button_frame, text="Apply Fit", command=self._apply_fit).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Refit All", command=self._refit_all).pack(side=tk.LEFT, padx=5)
         
         results_frame = ttk.LabelFrame(tab, text="Fitting Results", padding="5")
-        results_frame.grid(row=4, column=0, sticky="nsew")
-        tab.rowconfigure(4, weight=1)
+        results_frame.grid(row=5, column=0, sticky="nsew")
+        tab.rowconfigure(5, weight=1)
         
         self.results_text = scrolledtext.ScrolledText(results_frame, height=15, wrap=tk.WORD)
         self.results_text.pack(fill=tk.BOTH, expand=True)
@@ -783,13 +798,23 @@ class ECAApp:
         if not models:
             messagebox.showwarning("Warning", "No simulations to fit")
             return
+            
+        selector_type = self.fit_selector_var.get()
+        use_cd = self.fit_central_density_var.get()
+        try:
+            use_train = int(self.fit_train_var.get())
+        except ValueError:
+            messagebox.showwarning("Warning", "Train must be an integer.")
+            return
+
+        SelectorClass = BeforeBunchSelector if selector_type == "BeforeBunch" else BunchAverageSelector
+        selector = SelectorClass(use_central_density=use_cd, use_train=use_train)
         
-        #try:
         fit_class = self.FIT_MODELS.get(model_name)
         if not fit_class:
             raise ValueError(f"Unknown fit model: {model_name}")
         
-        fit = fit_class(self.db) if model_name == "FurmanNPMC" else fit_class()
+        fit = fit_class(self.db, selector=selector) if model_name == "FurmanNPMC" else fit_class(selector=selector)
         
         self.progress_var.set("Starting fit...")
         self.root.update()
@@ -798,9 +823,6 @@ class ECAApp:
                             if self._execute_fit(fit, model, refit, i, len(models)))
         
         self._display_fit_results(success_count, len(models))
-        # except Exception as e:
-        #     messagebox.showerror("Error", f"Fitting failed: {str(e)}")
-        #     self._update_status("Fitting failed")
 
     def _execute_fit(self, fit, model: ECModel, refit: bool, current: int, total: int) -> bool:
         """Execute a single fit and update progress."""
@@ -1048,8 +1070,12 @@ class ECAApp:
         
         self.individual_central_density_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(fit_frame, text="Use Central Density", variable=self.individual_central_density_var).pack(side=tk.LEFT, padx=10)
+
+        ttk.Label(fit_frame, text="Train(s):").pack(side=tk.LEFT, padx=(5, 2))
+        self.individual_train_var = tk.StringVar()
+        ttk.Entry(fit_frame, textvariable=self.individual_train_var, width=8).pack(side=tk.LEFT, padx=2)
         
-        ttk.Label(fit_frame, text="Max X:").pack(side=tk.LEFT)
+        ttk.Label(fit_frame, text="Max X:").pack(side=tk.LEFT, padx=(5, 2))
         self.individual_max_x_var = tk.StringVar()
         ttk.Entry(fit_frame, textvariable=self.individual_max_x_var, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(fit_frame, text="Replot", command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=10)
@@ -1110,6 +1136,17 @@ class ECAApp:
         selected_fits = [name for name, var in self.individual_fit_vars.items() if var.get()]
         plotted_count = 0
         
+        # Parse manually provided trains
+        train_str = self.individual_train_var.get().strip()
+        manual_trains = None
+        if train_str:
+            try:
+                manual_trains = [int(t.strip()) for t in train_str.split(",")]
+                if len(manual_trains) == 1:
+                    manual_trains = manual_trains[0]
+            except ValueError:
+                pass # Fallback to default parsing
+                
         for selection in selections:
             try:
                 doc_id_idx = self.individual_columns.index("doc_id")
@@ -1120,12 +1157,22 @@ class ECAApp:
             model = ECModel(self.db.db, doc_id)
             path_exists = os.path.exists(model.path) and os.path.exists(os.path.join(model.path, "Pyecltest.mat"))
             
+            plot_trains = manual_trains
+            
             fits_to_plot = []
             for fit_model_name in selected_fits:
                 fit_class = self.FIT_MODELS.get(fit_model_name)
                 if fit_class:
-                    fits_to_plot.append(fit_class(self.db) if fit_model_name == "FurmanNPMC" else fit_class())
+                    fit_inst = fit_class(self.db) if fit_model_name == "FurmanNPMC" else fit_class()
+                    fits_to_plot.append(fit_inst)
+                    
+                    # If we don't have a manual train, grab the one this fit was trained on
+                    if plot_trains is None and hasattr(model, fit_inst.name + "_train"):
+                        plot_trains = getattr(model, fit_inst.name + "_train")
             
+            if plot_trains is None:
+                plot_trains = -1
+
             if not (path_exists or fits_to_plot):
                 continue
             
@@ -1140,7 +1187,8 @@ class ECAApp:
                 fit_max_x = 300.0
             
             model_plot(model=model, fits=fits_to_plot, size=ax, show_error=True, 
-                    central_density=cd_param, fit_maxX=fit_max_x, label=str(doc_id))
+                    central_density=cd_param, fit_maxX=fit_max_x, label=str(doc_id),
+                    train=plot_trains)
             plotted_count += 1
         
         if plotted_count > 0:

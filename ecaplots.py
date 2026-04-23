@@ -2,6 +2,8 @@ from eca import *
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.colors import Colormap, Normalize
+import numpy as np
+from typing import Iterable
 
 plt.rcParams['savefig.format'] = 'svg'
 plt.rcParams['figure.autolayout'] = False
@@ -18,36 +20,69 @@ def _axes(size: tuple[int, int] | None | Axes) -> Axes:
 
 def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None | Axes = (10, 5),
                  log: tuple[bool, bool] = (False, False), show_error: bool = True, refit: bool = False,
-                 central_density: bool | None = False, fit_maxX: float = -1.0, label: str | None = None):
+                 central_density: bool | None = False, fit_maxX: float = -1.0, label: str | None = None,
+                 train: int | list[int] | np.ndarray | None = None):
     """
     Plot the raw data and each Fit if it succeeded.
     """
     ax = _axes(size)
-    if len(list(fits)) == 0:
-        step = model.time_to_index(model.t_offs)
-        if not central_density is None:
-            if central_density:
-                B = (model.time[::step] - model.t_offs) / model.b_spac
-                F = model.central_density[::step]
+    fits_list = list(fits)
+
+    # Extract the raw continuous data for the specified train(s) if needed
+    if not (central_density is None):
+        step = max(1, model.time_to_index(model.t_offs))
+        idx_base = np.arange(0, len(model.time), step)
+        if train is not None:
+            if isinstance(train, (int, np.integer)):
+                trains = [train]
             else:
-                B = (model.time[::step] - model.t_offs) / model.b_spac
-                F = model.N_electrons[::step]
-            if fit_maxX > 0:
-                B, F = B[B <= fit_maxX], F[B <= fit_maxX]
-            ax.scatter(B, F, s=1, label=("" if label is None else label + " ") + "Data")
+                trains = train
+            mask = np.zeros(len(model.time), dtype=bool)
+            for t in trains:
+                try:
+                    mask[model.train_to_index(t)] = True
+                except IndexError:
+                    pass # Train index might be out of bounds, skip it gracefully
+            plot_idx = idx_base[mask[idx_base]]
+        else:
+            plot_idx = idx_base
+        T_raw = model.time[plot_idx]
+        B_raw = (T_raw - model.t_offs) / model.b_spac
+        if central_density:
+            F_raw = model.central_density[plot_idx]
+        else:
+            F_raw = model.N_electrons[plot_idx]
+    if len(fits_list) == 0:
+        if not (central_density is None):
+            if fit_maxX > 0 and len(B_raw) > 0:
+                start_b = B_raw[0]
+                valid = B_raw <= start_b + fit_maxX
+                B_raw, F_raw = B_raw[valid], F_raw[valid]
+            ax.scatter(B_raw, F_raw, s=1, label=("" if label is None else label + " ") + "Data")
     else:
-        for fit in fits:
+        for fit in fits_list:
             result = fit.fit(model, refit=refit)
             if central_density is None:
-                T = np.arange(model.t_offs, fit_maxX * model.b_spac)
+                T = np.arange(model.t_offs, fit_maxX * model.b_spac if fit_maxX > 0 else model.time[-1])
                 F = np.zeros_like(T)
             else:
                 T, F = fit.select_data(model)
-            if fit_maxX > 0:
-                T, F = T[T <= fit_maxX * model.b_spac], F[T <= fit_maxX * model.b_spac]
-            Tsmooth = np.linspace(0, max(fit_maxX * model.b_spac, T[-1]), int(max(fit_maxX, T[-1] / model.b_spac))+1)          
-            B = (T - model.t_offs) / model.b_spac
-            Bsmooth = (Tsmooth - model.t_offs) / model.b_spac
+            
+            if fit_maxX > 0 and len(T) > 0:
+                valid = T <= T[0] + fit_maxX * model.b_spac
+                T, F = T[valid], F[valid]
+                
+            if len(T) > 0:
+                start_t = T[0]
+                end_t = max(T[-1], start_t + fit_maxX * model.b_spac if fit_maxX > 0 else T[-1])
+            else:
+                start_t = 0
+                end_t = fit_maxX * model.b_spac if fit_maxX > 0 else model.time[-1]
+
+            Tsmooth = np.linspace(start_t, end_t, max(100, int((end_t - start_t) / model.b_spac) + 1))
+            #B = (T - model.t_offs) / model.b_spac
+            B = ((T + model.train_times[fit._mget("train", model, -1)]) - model.t_offs) / model.b_spac
+            Bsmooth = (Tsmooth + model.train_times[fit._mget("train", model, -1)] - model.t_offs) / model.b_spac
             if not (result is None):
                 ax.plot(Bsmooth, fit.fit_function(model)(Tsmooth), label=("" if label is None else label + " ") + fit.name + " Fit")
                 if show_error:
@@ -57,9 +92,20 @@ def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None
                         fit.fit_function(model, result[0] + result[1])(Tsmooth),
                         alpha=0.2, label=("" if label is None else label + " ") + fit.name + " Fit Error")
             else:
-                print("Fitting failed: {}".format(getattr(model, "_"+fit.name+"_fitting_error")))
+                err_msg = getattr(model, "_"+fit.name+"_fitting_error", "Unknown error")
+                print("Fitting failed: {}".format(err_msg))
+                
             if not (central_density is None):
-                ax.scatter(B, F, s=1, label="Data: {}".format(fit.name))
+                ax.scatter(B, F, s=20, marker="x", label="Fit Points: {}".format(fit.name))
+                
+        # Overlay the continuous raw data for the specified train
+        if not (central_density is None):
+            if fit_maxX > 0 and len(B_raw) > 0:
+                start_b = B_raw[0]
+                valid = B_raw <= start_b + fit_maxX
+                B_raw, F_raw = B_raw[valid], F_raw[valid]
+            ax.scatter(B_raw, F_raw, s=1, alpha=0.5, label=("" if label is None else label + " ") + "Raw Data")
+
     if log[0]: ax.set_xscale("log")
     if log[1]: ax.set_yscale("log")
     if not size is None:

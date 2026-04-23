@@ -889,8 +889,8 @@ class BeforeBunchSelector(DataSelector):
     """
     def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
         pre_bp = np.array(model.time_to_index(model.bunch_times[model.train_to_bunches(self.use_train)] - model.half_bunch))
-        return (model.time[pre_bp],
-                (model.central_density if self.use_central_density else model.N_electrons)[pre_bp])
+        time = model.time[pre_bp]
+        return (time - time[0], (model.central_density if self.use_central_density else model.N_electrons)[pre_bp])
 
 class BunchAverageSelector(DataSelector):
     """
@@ -903,7 +903,8 @@ class BunchAverageSelector(DataSelector):
         for b, start in enumerate(pre_bp):
             averages[b] = np.mean(
                 (model.central_density if self.use_central_density else model.N_electrons)[start:start+model.bunch_step])
-        return ((model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid], averages)
+        time = (model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid]
+        return (time - time[0], averages)
 
 class Fit(object):
     """
@@ -1123,11 +1124,11 @@ class FurmanNoPhotoFit(Fit):
     def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
         xdata, ydata = self.select_data(model)
         _, scale_y = self.scale_factor(model, xdata, ydata)
-        self.fix({"y0": model.Ne_0 * scale_y})
+        self.fix({"y0": ydata[0] * scale_y})
         if model.buildup:
             mslope = np.argmin(np.square(ydata - ((ydata[-1] - ydata[0])/2)))
             bounds = {
-                "yc": (model.Ne_0 * scale_y, self.limit_estimate(xdata, ydata)*scale_y),
+                "yc": (ydata[0] * scale_y, self.limit_estimate(xdata, ydata)*scale_y),
                 "beta": (0, np.inf)#max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
             }
             self.initial({
@@ -1140,7 +1141,7 @@ class FurmanNoPhotoFit(Fit):
                 "beta": (-np.inf, 0)
             }
             self.initial({
-                "yc": 2*model.Ne_0*scale_y,
+                "yc": 2*ydata[0]*scale_y,
                 "beta": -0.1
             })
         self.bound(bounds)
@@ -1245,7 +1246,7 @@ class FurmanPhotoFit(Fit):
     def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
         xdata, ydata = self.select_data(model)
         _, scale_y = self.scale_factor(model, xdata, ydata)
-        self.fix({"y0": model.Ne_0 * scale_y})
+        self.fix({"y0": ydata[0] * scale_y})
         if model.buildup:
             np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
             if np_result is None:
@@ -1253,7 +1254,7 @@ class FurmanPhotoFit(Fit):
                 setattr(model, "_"+self.name+"_fitting_error", "The underlying NoPhoto fit failed.")
                 return None
             self.bound({
-                "yc": (model.Ne_0 * scale_y, max(self.limit_estimate(xdata, ydata)*scale_y, np_result[0,0])),
+                "yc": (ydata[0] * scale_y, max(self.limit_estimate(xdata, ydata)*scale_y, np_result[0,0])),
                 "alpha": (0, model.k_pe_st*scipy.constants.c*model.b_spac),
                 "beta": (0, max(np_result[0,1], 1))
             })
