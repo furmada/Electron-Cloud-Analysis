@@ -955,7 +955,7 @@ class Fit(object):
         elif len(ydata) <= 5:
             return ydata[-1]
         smooth_diff = smooth(np.diff(ydata), max(ydata.size // 10, 5))
-        if np.mean(smooth_diff[-max(ydata.size // 10, 5):]) >= ydata[-1]*1e-3:
+        if np.mean(smooth_diff[-max(ydata.size // 10, 5):]) >= ydata[-1]*1e-2:
             # We have likely not completed the buildup within the simulation window
             return  (3 + (np.argmax(smooth_diff) / smooth_diff.size))*np.max(ydata)
         else:
@@ -1129,7 +1129,7 @@ class FurmanNoPhotoFit(Fit):
             mslope = np.argmin(np.square(ydata - ((ydata[-1] - ydata[0])/2)))
             bounds = {
                 "yc": (ydata[0] * scale_y, self.limit_estimate(xdata, ydata)*scale_y),
-                "beta": (0, np.inf)#max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
+                "beta": (0, 3*model.del_max)#max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
             }
             self.initial({
                 "yc": self.limit_estimate(xdata, ydata)*scale_y,
