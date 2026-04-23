@@ -1066,14 +1066,18 @@ class ECAApp:
         for fit_name in self.FIT_MODELS.keys():
             var = tk.BooleanVar(value=False)
             self.individual_fit_vars[fit_name] = var
-            ttk.Checkbutton(fit_frame, text=fit_name, variable=var).pack(side=tk.LEFT, padx=5)
+            # Bind the checkbutton to immediately redraw the plot
+            ttk.Checkbutton(fit_frame, text=fit_name, variable=var, command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=5)
         
         self.individual_central_density_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fit_frame, text="Use Central Density", variable=self.individual_central_density_var).pack(side=tk.LEFT, padx=10)
+        ttk.Checkbutton(fit_frame, text="Use Central Density", variable=self.individual_central_density_var, command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=10)
 
-        ttk.Label(fit_frame, text="Train(s):").pack(side=tk.LEFT, padx=(5, 2))
-        self.individual_train_var = tk.StringVar()
-        ttk.Entry(fit_frame, textvariable=self.individual_train_var, width=8).pack(side=tk.LEFT, padx=2)
+        # Replace text entry with Combobox for selecting train
+        ttk.Label(fit_frame, text="View Train:").pack(side=tk.LEFT, padx=(5, 2))
+        self.individual_train_var = tk.StringVar(value="All")
+        self.individual_train_combo = ttk.Combobox(fit_frame, textvariable=self.individual_train_var, state="readonly", width=8)
+        self.individual_train_combo.pack(side=tk.LEFT, padx=2)
+        self.individual_train_combo.bind("<<ComboboxSelected>>", lambda e: self._plot_individual_simulation())
         
         ttk.Label(fit_frame, text="Max X:").pack(side=tk.LEFT, padx=(5, 2))
         self.individual_max_x_var = tk.StringVar()
@@ -1123,7 +1127,7 @@ class ECAApp:
                      for col in self.individual_columns]
             self.individual_sim_tree.insert("", tk.END, values=values)
 
-    def _plot_individual_simulation(self):
+    def _plot_individual_simulation(self, *args):
         """Plot selected simulation(s)."""
         selections = self.individual_sim_tree.selection()
         if not (selections and self.db):
@@ -1136,17 +1140,38 @@ class ECAApp:
         selected_fits = [name for name, var in self.individual_fit_vars.items() if var.get()]
         plotted_count = 0
         
-        # Parse manually provided trains
-        train_str = self.individual_train_var.get().strip()
-        manual_trains = None
-        if train_str:
+        # Determine train view logic and populate dropdown if exactly 1 simulation is selected
+        if len(selections) == 1:
             try:
-                manual_trains = [int(t.strip()) for t in train_str.split(",")]
-                if len(manual_trains) == 1:
-                    manual_trains = manual_trains[0]
-            except ValueError:
-                pass # Fallback to default parsing
+                doc_id_idx = self.individual_columns.index("doc_id")
+                doc_id = int(self.individual_sim_tree.item(selections[0])['values'][doc_id_idx])
+                model = ECModel(self.db.db, doc_id)
+                num_trains = len(model.train_times)
+                train_options = ["All"] + [str(i) for i in range(num_trains)]
                 
+                # Check if we should update default selection (due to model or fit toggles)
+                if getattr(self, '_last_doc_id', None) != doc_id or getattr(self, '_last_fits', None) != selected_fits:
+                    self.individual_train_combo['values'] = train_options
+                    if selected_fits:
+                        fit_class = self.FIT_MODELS[selected_fits[0]]
+                        fit_inst = fit_class(self.db) if selected_fits[0] == "FurmanNPMC" else fit_class()
+                        fit_train = fit_inst._mget("train", model, -1)
+                        if fit_train < 0:
+                            fit_train += num_trains
+                        if 0 <= fit_train < num_trains:
+                            self.individual_train_var.set(str(fit_train))
+                    else:
+                        self.individual_train_var.set("All")
+                        
+                    self._last_doc_id = doc_id
+                    self._last_fits = selected_fits.copy()
+            except (ValueError, IndexError, AttributeError):
+                pass
+
+        # Parse selected train
+        train_str = self.individual_train_var.get().strip()
+        plot_train = "All" if not train_str or train_str.lower() == "all" else int(train_str)
+        
         for selection in selections:
             try:
                 doc_id_idx = self.individual_columns.index("doc_id")
@@ -1157,22 +1182,13 @@ class ECAApp:
             model = ECModel(self.db.db, doc_id)
             path_exists = os.path.exists(model.path) and os.path.exists(os.path.join(model.path, "Pyecltest.mat"))
             
-            plot_trains = manual_trains
-            
             fits_to_plot = []
             for fit_model_name in selected_fits:
                 fit_class = self.FIT_MODELS.get(fit_model_name)
                 if fit_class:
                     fit_inst = fit_class(self.db) if fit_model_name == "FurmanNPMC" else fit_class()
                     fits_to_plot.append(fit_inst)
-                    
-                    # If we don't have a manual train, grab the one this fit was trained on
-                    if plot_trains is None and hasattr(model, fit_inst.name + "_train"):
-                        plot_trains = getattr(model, fit_inst.name + "_train")
             
-            if plot_trains is None:
-                plot_trains = -1
-
             if not (path_exists or fits_to_plot):
                 continue
             
@@ -1187,8 +1203,8 @@ class ECAApp:
                 fit_max_x = 300.0
             
             model_plot(model=model, fits=fits_to_plot, size=ax, show_error=True, 
-                    central_density=cd_param, fit_maxX=fit_max_x, label=str(doc_id),
-                    train=plot_trains)
+                       central_density=cd_param, fit_maxX=fit_max_x, label=str(doc_id),
+                       train=plot_train)
             plotted_count += 1
         
         if plotted_count > 0:

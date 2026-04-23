@@ -21,98 +21,94 @@ def _axes(size: tuple[int, int] | None | Axes) -> Axes:
 def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None | Axes = (10, 5),
                  log: tuple[bool, bool] = (False, False), show_error: bool = True, refit: bool = False,
                  central_density: bool | None = False, fit_maxX: float = -1.0, label: str | None = None,
-                 train: int | list[int] | np.ndarray | None = None):
+                 train: int | str | None = "All"):
     """
     Plot the raw data and each Fit if it succeeded.
+    Confines fit functions to the trains they were evaluated on.
     """
     ax = _axes(size)
     fits_list = list(fits)
 
-    # Extract the raw continuous data for the specified train(s) if needed
-    if not (central_density is None):
+    is_all_trains = train is None or str(train).lower() == "all"
+    plot_train_idx = None if is_all_trains else int(train)
+
+    # --- 1. Plot Raw Data ---
+    if central_density is not None:
         step = max(1, model.time_to_index(model.t_offs))
-        idx_base = np.arange(0, len(model.time), step)
-        if train is not None:
-            if isinstance(train, (int, np.integer)):
-                trains = [train]
-            else:
-                trains = train
-            mask = np.zeros(len(model.time), dtype=bool)
-            for t in trains:
-                try:
-                    mask[model.train_to_index(t)] = True
-                except IndexError:
-                    pass # Train index might be out of bounds, skip it gracefully
-            plot_idx = idx_base[mask[idx_base]]
+        
+        if is_all_trains:
+            plot_idx = np.arange(0, model.cutoff, step)
         else:
-            plot_idx = idx_base
+            try:
+                plot_idx = model.train_to_index(plot_train_idx)[::step]
+            except IndexError:
+                plot_idx = np.arange(0, model.cutoff, step) # Fallback if out of bounds
+
         T_raw = model.time[plot_idx]
         B_raw = (T_raw - model.t_offs) / model.b_spac
-        if central_density:
-            F_raw = model.central_density[plot_idx]
-        else:
-            F_raw = model.N_electrons[plot_idx]
-    if len(fits_list) == 0:
-        if not (central_density is None):
-            if fit_maxX > 0 and len(B_raw) > 0:
-                start_b = B_raw[0]
-                valid = B_raw <= start_b + fit_maxX
-                B_raw, F_raw = B_raw[valid], F_raw[valid]
-            ax.scatter(B_raw, F_raw, s=1, label=("" if label is None else label + " ") + "Data")
-    else:
-        for fit in fits_list:
-            result = fit.fit(model, refit=refit)
-            if central_density is None:
-                T = np.arange(model.t_offs, fit_maxX * model.b_spac if fit_maxX > 0 else model.time[-1])
-                F = np.zeros_like(T)
-            else:
-                T, F = fit.select_data(model)
-            
-            if fit_maxX > 0 and len(T) > 0:
-                valid = T <= T[0] + fit_maxX * model.b_spac
-                T, F = T[valid], F[valid]
-                
-            if len(T) > 0:
-                start_t = T[0]
-                end_t = max(T[-1], start_t + fit_maxX * model.b_spac if fit_maxX > 0 else T[-1])
-            else:
-                start_t = 0
-                end_t = fit_maxX * model.b_spac if fit_maxX > 0 else model.time[-1]
+        F_raw = model.central_density[plot_idx] if central_density else model.N_electrons[plot_idx]
 
-            Tsmooth = np.linspace(start_t, end_t, max(100, int((end_t - start_t) / model.b_spac) + 1))
-            #B = (T - model.t_offs) / model.b_spac
-            B = ((T + model.train_times[fit._mget("train", model, -1)]) - model.t_offs) / model.b_spac
-            Bsmooth = (Tsmooth + model.train_times[fit._mget("train", model, -1)] - model.t_offs) / model.b_spac
-            if not (result is None):
-                ax.plot(Bsmooth, fit.fit_function(model)(Tsmooth), label=("" if label is None else label + " ") + fit.name + " Fit")
+        # Constrain X-axis view if focused on a specific train
+        if fit_maxX > 0 and len(B_raw) > 0 and not is_all_trains:
+            valid = B_raw <= (B_raw[0] + fit_maxX)
+            B_raw, F_raw = B_raw[valid], F_raw[valid]
+
+        alpha = 0.5 if fits_list else 1.0
+        ax.scatter(B_raw, F_raw, s=1, alpha=alpha, label=f"{label + ' ' if label else ''}Raw Data")
+
+    # --- 2. Plot Fits ---
+    for fit in fits_list:
+        result = fit.fit(model, refit=refit)
+        fit_train = fit._mget("train", model, -1)
+        
+        T_fit_pts, F_fit_pts = fit.select_data(model)
+        if len(T_fit_pts) == 0:
+            continue
+
+        # Evaluate fit function over the exact span of the selected data points
+        T_max = T_fit_pts[-1]
+        if fit_maxX > 0:
+            T_max = min(T_max, fit_maxX * model.b_spac)
+
+        T_smooth = np.linspace(0, T_max, max(100, int(T_max / model.b_spac) + 1))
+        
+        try:
+            train_start_time = model.train_times[fit_train]
+        except IndexError:
+            train_start_time = model.train_times[-1]
+
+        # Map relative time back to absolute bunch passage for plotting
+        B_smooth = (T_smooth + train_start_time - model.t_offs) / model.b_spac
+        B_fit_pts = (T_fit_pts + train_start_time - model.t_offs) / model.b_spac
+
+        # Render fit curve only if we plot all, or if its train matches the requested view
+        num_trains = len(model.train_times)
+        actual_fit_train = fit_train if fit_train >= 0 else num_trains + fit_train
+        
+        if is_all_trains or plot_train_idx == actual_fit_train:
+            if result is not None:
+                fit_fn = fit.fit_function(model)
+                ax.plot(B_smooth, fit_fn(T_smooth), label=f"{label + ' ' if label else ''}{fit.name} Fit")
+                
                 if show_error:
                     ax.fill_between(
-                        Bsmooth,
-                        fit.fit_function(model, result[0] - result[1])(Tsmooth),
-                        fit.fit_function(model, result[0] + result[1])(Tsmooth),
-                        alpha=0.2, label=("" if label is None else label + " ") + fit.name + " Fit Error")
+                        B_smooth,
+                        fit.fit_function(model, result[0] - result[1])(T_smooth),
+                        fit.fit_function(model, result[0] + result[1])(T_smooth),
+                        alpha=0.2
+                    )
             else:
-                err_msg = getattr(model, "_"+fit.name+"_fitting_error", "Unknown error")
-                print("Fitting failed: {}".format(err_msg))
-                
-            if not (central_density is None):
-                ax.scatter(B, F, s=20, marker="x", label="Fit Points: {}".format(fit.name))
-                
-        # Overlay the continuous raw data for the specified train
-        if not (central_density is None):
-            if fit_maxX > 0 and len(B_raw) > 0:
-                start_b = B_raw[0]
-                valid = B_raw <= start_b + fit_maxX
-                B_raw, F_raw = B_raw[valid], F_raw[valid]
-            ax.scatter(B_raw, F_raw, s=1, alpha=0.5, label=("" if label is None else label + " ") + "Raw Data")
+                print(f"Fitting failed: {getattr(model, '_' + fit.name + '_fitting_error', 'Unknown error')}")
+
+            if central_density is not None:
+                ax.scatter(B_fit_pts, F_fit_pts, s=20, marker="x", label=f"Fit Points: {fit.name}")
 
     if log[0]: ax.set_xscale("log")
     if log[1]: ax.set_yscale("log")
-    if not size is None:
-        ax.set_xlabel("Bunch Passage")
-        ax.set_ylabel("N. Electrons in Centre / m" if central_density == True else "N. Electrons / m")
-        ax.set_title("SEY={:.2f}, I={:.2E}, B={}".format(model.del_max, model.fact_beam, model.B_multip))
-        ax.legend()
+    ax.set_xlabel("Bunch Passage")
+    ax.set_ylabel("N. Electrons in Centre / m" if central_density else "N. Electrons / m")
+    ax.set_title(f"SEY={model.del_max:.2f}, I={model.fact_beam:.2E}, B={model.B_multip}")
+    ax.legend()
 
 def versus_plot(db: SimDB, paramA: str, paramB: str, colorBy: str | None = None, size: tuple[int, int] | None = (8, 6), 
                 dot_size: int = 10, log: tuple[bool, bool] = (False, False), colormap: None | Colormap = None, **restrict) -> tuple:
