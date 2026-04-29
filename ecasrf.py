@@ -9,7 +9,7 @@ from typing import Iterable
 import numpy as np
 import scipy.io as sio
 from scipy.stats import iqr
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, savgol_filter, peak_widths
 from scipy.optimize import minimize, curve_fit
 from scipy.ndimage import gaussian_filter1d, maximum_filter1d
 from scipy.interpolate import interp1d
@@ -58,11 +58,57 @@ def read_flux_data(flux_files: list[str] | str | tuple) -> np.ndarray:
     x_coord, y_coord, z_coord, F_value = np.array([]), np.array([]), np.array([]), np.array([])
     for flux_file in ((flux_files,) if type(flux_files) == str else flux_files):
         flux_data = np.loadtxt(flux_file, skiprows=1).T
-        x_coord = np.concat((x_coord, flux_data[0] / 100)) # Given in cm, we want m
-        y_coord = np.concat((y_coord, flux_data[1] / 100))
-        z_coord = np.concat((z_coord, flux_data[2] / 100))
-        F_value = np.concat((F_value, flux_data[3]))
-    return np.array([x_coord.ravel(), y_coord.ravel(), z_coord.ravel(), F_value.ravel()])
+        x_coord = np.concatenate((x_coord, flux_data[0] / 100), axis=None) # Given in cm, we want m
+        y_coord = np.concatenate((y_coord, flux_data[1] / 100), axis=None)
+        z_coord = np.concatenate((z_coord, flux_data[2] / 100), axis=None)
+        F_value = np.concatenate((F_value, flux_data[3]), axis=None)
+    order = np.argsort(z_coord).ravel()
+    return np.array([x_coord.ravel()[order], y_coord.ravel()[order], z_coord.ravel()[order], F_value.ravel()[order]])
+
+def unbend_data(points, elements):
+    """
+    Unbends planar (XZ) tube data using local reference trajectory offsets.
+    
+    Parameters:
+    - points: (3, N) array of (x, y, z)
+    - bending_elements: List of tuples (z_ref, x_ref, theta_ref, s_ref)
+    
+    Returns:
+    - unbent_points: (3, N) array with X-Z plane straightened
+    """
+    bending_elements = np.array([
+        (e["start Z (m)"], e["start X (m)"], e["start Theta [rad]"], e["start s [m]"]) 
+        for e in elements
+    ])
+    # Convert list of tuples to numpy arrays for vectorized interpolation
+    z_ref_vals = bending_elements[:, 0]
+    x_ref_vals = bending_elements[:, 1]
+    theta_vals = bending_elements[:, 2]
+    s_ref_vals = bending_elements[:, 3]
+    
+    # 1. Interpolate the reference trajectory for every point's global Z
+    # Note: interp expects x-coordinates (z_ref_vals) to be increasing.
+    x_ref_interp = np.interp(points[2, :], z_ref_vals, x_ref_vals)
+    theta_interp = np.interp(points[2, :], z_ref_vals, theta_vals)
+    s_ref_interp = np.interp(points[2, :], z_ref_vals, s_ref_vals)
+    z_ref_interp = np.interp(points[2, :], z_ref_vals, z_ref_vals) # usually just points[2,:]
+    
+    # 2. Calculate local offsets from the reference trajectory (Translation)
+    dx = points[0, :] - x_ref_interp
+    dz = points[2, :] - z_ref_interp
+    
+    # 3. Rotate the local offset vector by -theta (Rotation)
+    # This aligns the local cross-section with the new straight Z-axis
+    c = np.cos(-theta_interp)
+    s = np.sin(-theta_interp)
+    
+    # x_unbent is the transverse distance from the design orbit
+    x_unbent = dx * c - dz * s
+    # z_unbent is the path length (s) plus the longitudinal projection of the offset
+    z_unbent = s_ref_interp + (dx * s + dz * c)
+    y_unbent = points[1, :]
+    
+    return np.vstack((x_unbent, y_unbent, z_unbent))
 
 def slice_flux_data(flux_files: list[str] | str | tuple, dZ: float, num_points: int = 121, verbose=True) -> tuple[np.ndarray, list[np.ndarray]]:
     """
@@ -103,36 +149,6 @@ def slice_flux_data(flux_files: list[str] | str | tuple, dZ: float, num_points: 
         if verbose: print("{:<5.2f}".format(z), end="\r")
     if verbose: print("Done.    ")
     return Z_starts, slices
-
-def complete_slices(flux_files: list[str] | str | tuple, angle_gap: float = np.pi / 20) -> list[np.ndarray]:
-    """
-    Open the flux files, and find the densest collection of "complete" (e.g. 360 degrees of data) slices.
-    """
-    # Read the data
-    x_coord, y_coord, z_coord, F_value = read_flux_data(flux_files)
-    order = np.argsort(z_coord)
-    x_coord, y_coord, z_coord, F_value = x_coord[order], y_coord[order], z_coord[order], F_value[order]
-    # Find the unique z coordinates of the model
-    uZ = np.sort(np.unique(z_coord))
-    slices = [[] for _ in uZ]
-    uzi = 0
-    for i, z in enumerate(z_coord):
-        for j in range(uzi, uZ.size):
-            if z == uZ[j]:
-                uzi = j
-                break
-        slices[uzi].append(i)
-    # Each section represents a complete (angluar) collection of data points.
-    csections = []
-    lsection = np.array([], dtype=int)
-    for i in range(uZ.size):
-        lsection = np.concat((lsection, slices[i]), dtype=int).ravel()
-        if lsection.size <= 2: continue
-        theta = np.sort(np.atan2(y_coord[lsection] - np.mean(y_coord[lsection]), x_coord[lsection] - np.mean(x_coord[lsection])))
-        if np.max(np.diff(theta)) < angle_gap:
-            csections.append(lsection.copy())
-            lsection = np.array([], dtype=int)
-    return [np.array([x_coord[cs], y_coord[cs], z_coord[cs], F_value[cs]]) for cs in csections]
 
 def _max_inscribed_ellipse(X: np.ndarray, Y: np.ndarray) -> tuple[np.number, np.number]:
     """
@@ -257,6 +273,24 @@ def dedensify_envelope(x: np.ndarray, y: np.ndarray, f: np.ndarray, target: int 
     f_new = interp1d(C_ext, f_ext)(C_targets)    
     return np.array([x_new, y_new, f_new])
 
+def slice_and_dedensify(flux_files: list[str] | str | tuple, dZ: float, num_points: int = 121, verbose=True) -> tuple[np.ndarray, list[np.ndarray]]:
+    """
+    Open the flux file, and cut it into dZ[m] sized sections, binning
+    angularly into up to num_points segments.
+    """
+    # Read the data
+    x_coord, y_coord, z_coord, F_value = read_flux_data(flux_files)
+    # Set up outputs
+    Z_starts = np.arange(np.min(z_coord), np.max(z_coord), dZ)
+    slices = []
+    for z in Z_starts:
+        # Find the range of entries in this slice
+        z_range = np.bitwise_and(z_coord >= z, z_coord < z + dZ)
+        slices.append(dedensify_envelope(x_coord[z_range], y_coord[z_range], F_value[z_range], num_points))
+        if verbose: print("{:<5.2f}".format(z), end="\r")
+    if verbose: print("Done.    ")
+    return Z_starts, slices
+
 def slice_average(slices: list[np.ndarray]) -> np.ndarray:
     """
     Compute the average profile (X, Y, F) from a collection of slices.
@@ -280,104 +314,161 @@ def slice_average(slices: list[np.ndarray]) -> np.ndarray:
     averaged_slice = np.mean(stacked_slices, axis=0)
     return averaged_slice
 
-def _gauss(x, a, mu, sigma, c):
-    """Gaussian profile for fitting the flux peak or valley."""
-    return a * np.exp(-(x - mu)**2 / (2 * sigma**2)) + c
+def _find_periodic_peaks_uniform(signal, distance=None, prominence=None, width=None):
+    """
+    Wrapper for find_peaks that handles periodic boundary conditions via padding.
+    Assumes 'signal' is uniformly sampled.
+    """
+    n = len(signal)
+    # Pad to handle periodicity: [end...start] + [original] + [end...start]
+    # Pad size should be large enough to catch wide peaks near boundaries
+    pad_size = max(n // 4, 20) 
+    wrapped_signal = np.concatenate([signal[-pad_size:], signal, signal[:pad_size]])
+    
+    if distance is None:
+        distance = max(10, n // 10)
+    
+    peaks, properties = find_peaks(
+        wrapped_signal,
+        distance=distance,
+        prominence=prominence,
+        width=width,
+        rel_height=0.5
+    )
+    
+    # Filter to original range [pad_size, pad_size + n)
+    valid_mask = (peaks >= pad_size) & (peaks < pad_size + n)
+    valid_peaks = peaks[valid_mask] - pad_size
+    
+    # Filter properties
+    filtered_props = {}
+    for key, val in properties.items():
+        if isinstance(val, np.ndarray):
+            filtered_props[key] = val[valid_mask]
+        else:
+            filtered_props[key] = val
+            
+    return valid_peaks, filtered_props
 
-def fit_flux_feature(theta: np.ndarray, log_f: np.ndarray, mu_log: float) -> tuple[float, float]:
+def find_asymmetries(x: np.ndarray, y: np.ndarray, f: np.ndarray, 
+                     min_prominence_factor: float = 0.1, 
+                     min_distance_factor: float = 0.05,
+                     interp_points: int = 200) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Factors out the Gaussian curve fitting. Uses scipy.signal.find_peaks to intelligently 
-    locate the true structural peak/valley, avoiding single-facet noise spikes.
+    Improved peak and valley detection with explicit interpolation to uniform grid.
+    
+    This ensures that width calculations (in radians) are accurate even if the 
+    input data points are not perfectly equispaced in angle.
     """
-    f_range = iqr(log_f)
-    if f_range < 1:
-        return 0, np.nan
-    is_max = np.sum(log_f > mu_log + f_range) > np.sum(log_f < mu_log - f_range)
-    bounds = ([0 if is_max else -10, 0.0, 0.01, np.min(log_f)], [10 if is_max else 0, 2*np.pi, np.inf, np.max(log_f)])
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            popt, _ = curve_fit(_gauss, theta, log_f, 
-                                p0=[0, np.pi, np.pi, mu_log], 
-                                bounds=bounds,
-                                maxfev=2000)
-        peak_strength, peak_mu, peak_width, bg_c = popt
-    except RuntimeError:
-        # Fallback if the curve fit fails to converge
-        peak_strength = 0
-        peak_width = np.nan
+    if len(f) < 20:
+        return np.array([]), np.array([]), np.array([])
+
+    # 1. Preprocessing: Calculate Angles
+    # Using the specific centering logic from your snippet: -(x - cx)
+    cx, cy = np.mean(x), np.mean(y)
+    # Angle calculation matching your snippet: atan2(y-cy, -(x-cx))
+    # This sets 0 radians at the positive X-axis (if x>cx, y=cy -> atan2(0, -pos) = pi? 
+    # Wait: atan2(y, -x). If x>cx, -x is negative. atan2(0, neg) = pi.
+    # If x<cx, -x is positive. atan2(0, pos) = 0.
+    # This effectively rotates the phase by 180 degrees compared to standard atan2(y,x).
+    # We will stick to your logic exactly.
+    angle_raw = np.arctan2(y - cy, -(x - cx))
+    
+    # Normalize to [0, 2pi)
+    angle = angle_raw.copy()
+    angle[angle < 0] += 2 * np.pi
+    
+    # Sort by angle to prepare for interpolation
+    sort_idx = np.argsort(angle)
+    angle_sorted = angle[sort_idx]
+    f_sorted = f[sort_idx]
+    
+    # Handle potential log issues
+    f_safe = np.where(f_sorted < 1e-12, 1e-12, f_sorted)
+    logF = np.log10(f_safe)
+    
+    # 2. Interpolation to Uniform Grid
+    # Create a strictly uniform grid of angles from 0 to 2pi
+    # We use 'cubic' or 'linear'. Cubic is smoother but can overshoot. Linear is safer for sharp peaks.
+    # Given the physics, cubic spline is usually fine if the data is smooth enough.
+    # We add a small epsilon to the end to ensure the wrap-around is handled if we were doing cyclic interp,
+    # but here we just map 0->2pi.
+    new_angles = np.linspace(0, 2 * np.pi, interp_points, endpoint=False)
+    
+    # Interpolate
+    # Note: Since the data is periodic, we should ideally handle the wrap-around in interpolation.
+    # However, since we are just mapping 0->2pi and the data is likely continuous there, 
+    # standard interpolation works if the first and last points are close in value.
+    # To be safe, we can append the first point to the end for interpolation continuity.
+    angle_interp = np.concatenate([angle_sorted, angle_sorted[0:1] + 2*np.pi])
+    logF_interp = np.concatenate([logF, logF[0:1]])
+    
+    # Create interpolation function
+    # 'kind'='cubic' provides smooth derivatives for better peak finding
+    f_interp = interp1d(angle_interp, logF_interp, kind='cubic', fill_value="extrapolate")
+    
+    # Sample on the uniform grid
+    uniform_logF = f_interp(new_angles)
+    
+    # 3. Smoothing (Optional but recommended for noisy data)
+    # Window size relative to the new uniform grid
+    win_size = int(min(max(5, interp_points * 0.05), interp_points // 2))
+    if win_size % 2 == 0: win_size += 1
+    smooth_logF = savgol_filter(uniform_logF, win_size, 3)
+    
+    # 4. Define Detection Parameters
+    signal_range = np.max(smooth_logF) - np.min(smooth_logF)
+    min_prominence = signal_range * min_prominence_factor
+    # Distance in samples on the UNIFORM grid
+    min_distance_samples = int(interp_points * min_distance_factor)
+    
+    # 5. Detect Peaks and Valleys
+    peaks_idx, _ = _find_periodic_peaks_uniform(
+        smooth_logF, 
+        distance=min_distance_samples, 
+        prominence=min_prominence
+    )
+    
+    valleys_idx, _ = _find_periodic_peaks_uniform(
+        -smooth_logF, 
+        distance=min_distance_samples, 
+        prominence=min_prominence
+    )
+    
+    # 6. Calculate Widths
+    # Since the grid is uniform, width in samples converts directly to radians
+    # Resolution: 2pi / interp_points radians per sample
+    rad_per_sample = 2 * np.pi / interp_points
+    
+    peak_widths_rad = np.zeros(len(peaks_idx))
+    if len(peaks_idx) > 0:
+        w_res = peak_widths(smooth_logF, peaks_idx, rel_height=0.5)
+        peak_widths_rad = w_res[0] * rad_per_sample
         
-    return peak_strength, peak_width
+    valley_widths_rad = np.zeros(len(valleys_idx))
+    if len(valleys_idx) > 0:
+        w_res = peak_widths(-smooth_logF, valleys_idx, rel_height=0.5)
+        valley_widths_rad = w_res[0] * rad_per_sample
 
-def extract_slice_metrics(x: np.ndarray, y: np.ndarray, f: np.ndarray) -> tuple[float, float, float, float]:
-    """
-    Computes total flux, asymmetry ratio, and Gaussian peak metrics (strength, width)
-    by analyzing the flux over the angular profile of the chamber.
-    """
-    total_flux = np.sum(f)
-    if total_flux <= 0:
-        return 0.0, np.nan, np.nan, 0.0
-    theta = np.arctan2(y, -x)
-    theta[theta < 0] += 2 * np.pi
-    order = np.argsort(theta)
-    theta_sorted = theta[order]
-    f_sorted = f[order]
-    log_f = np.log10(f_sorted + 1e-12)
-    peak_strength, peak_width = fit_flux_feature(theta_sorted, log_f, np.mean(log_f))    
-    if np.isnan(peak_width):
-        # Graceful fallback if the fit completely failed but flux exists
-        asymmetry = 0
-    else:
-        # High amplitude (difference from mean) + highly localized (small width) = High Asymmetry.
-        # The sign of peak_strength automatically dictates if it's a peak (+) or a valley (-).
-        asymmetry = peak_strength / peak_width
-    if asymmetry > 0:
-        print("{:.2E}, {:.2f}, {:.2f}, {:.2f}".format(total_flux, peak_strength, peak_width, asymmetry))
-    return total_flux, peak_strength, peak_width, asymmetry
-
-def build_system_analysis(Zs: np.ndarray, slices: list[np.ndarray], elements: list[dict], absorbers: np.ndarray) -> dict:
-    """
-    Cross-references slice data with Twiss elements and absorbers to build a comprehensive 
-    dictionary of numpy arrays for pattern analysis.
-    """
-    data: dict[str, list | np.ndarray] = {
-        "Z": [], "Total_Flux": [], "Peak_Strength": [], "Peak_Width": [],
-        "Asymmetry": [], "Element_Name": [], "Element_Type": [],
-        "Mag_Field": [], "Dist_to_Absorber": []
-    }
-    for z, slc in zip(Zs, slices):
-        x, y, f = slc[0], slc[1], slc[2]
-        total_flux, peak_strength, peak_width, asymmetry = extract_slice_metrics(x, y, f)
-        # Identify the element overlapping this Z position
-        current_elem = "None"
-        elem_type = "Drift/Unknown"
-        mag_field = 0.0
-        for e in elements:
-            start_z = float(e.get("start Z (m)", 0))
-            length = float(e.get("length (m)", 0))
-            end_z = start_z + length
-            if start_z <= z <= end_z:
-                current_elem = e.get("Name", "Unknown")
-                if e.get("DIPOLE: Field (T)") is not None:
-                    elem_type = "Dipole"
-                    mag_field = float(e["DIPOLE: Field (T)"])
-                elif e.get("QUADRUPOLE: Gradient (T/m)") is not None:
-                    elem_type = "Quadrupole"
-                    mag_field = float(e["QUADRUPOLE: Gradient (T/m)"])
-                break
-        # Calculate distance to the most recent upstream absorber
-        past_absorbers = absorbers[absorbers <= z]
-        dist_to_abs = z - past_absorbers[-1] if len(past_absorbers) > 0 else np.nan
-        data["Z"].append(z)
-        data["Total_Flux"].append(total_flux)
-        data["Peak_Strength"].append(peak_strength)
-        data["Peak_Width"].append(peak_width)
-        data["Asymmetry"].append(asymmetry)
-        data["Element_Name"].append(current_elem)
-        data["Element_Type"].append(elem_type)
-        data["Mag_Field"].append(mag_field)
-        data["Dist_to_Absorber"].append(dist_to_abs)
-    # Convert lists to numpy arrays for easy indexing
-    for key in data:
-        data[key] = np.array(data[key])
-    return data
+    # 7. Compile Results
+    all_indices = np.concatenate([peaks_idx, valleys_idx])
+    
+    # Heights: Peaks are positive deviation, Valleys are negative deviation (depth)
+    # For valleys, we calculate depth relative to the max of the smoothed signal
+    median = np.median(smooth_logF)
+    all_heights = np.concatenate([
+        smooth_logF[peaks_idx] - median, 
+        -smooth_logF[valleys_idx] + median
+    ])
+    
+    all_widths = np.concatenate([peak_widths_rad, valley_widths_rad])
+    
+    # Sort by magnitude of deviation
+    order = np.argsort(np.abs(all_heights))[::-1]
+    
+    # Map indices back to actual angles
+    final_locations = new_angles[all_indices[order]]
+    final_heights = all_heights[order]
+    final_widths = all_widths[order]
+    
+    return final_locations, final_heights, final_widths

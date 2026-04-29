@@ -18,6 +18,13 @@ from shutil import copy2
 
 import os
 
+def unique_with_tolerance(arr, tol):
+    arr = np.sort(arr)
+    # Find indices where the difference between consecutive elements exceeds tolerance
+    split_indices = np.where(np.diff(arr) > tol)[0] + 1
+    # Split the sorted array at those indices and take the first element of each group
+    return np.array([group[0] for group in np.split(arr, split_indices)])
+
 class DBFolder(object):
     """
     A source folder for building a database, containing non-instability simulations.
@@ -779,8 +786,14 @@ class ECModel(SynchedEntry):
         """
         The times of each bunch train.
         """
-        where_gaps = np.argwhere(np.diff(self.bunch_times, prepend=self.t_offs) > self.b_spac + self.t_offs).ravel()
-        self.train_times = np.concat((np.array([self.bunch_times[0]]), self.bunch_times[where_gaps]), axis=None)
+        gap_lens = unique_with_tolerance(np.diff(self.bunch_times, prepend=self.t_offs), self.t_offs)
+        if len(np.where(gap_lens > self.t_offs)[0]) > 2:
+            # We actually have trains
+            where_gaps = np.argwhere(np.diff(self.bunch_times, prepend=self.t_offs) > np.max(gap_lens) - self.t_offs).ravel()
+            self.train_times = np.concat((np.array([self.bunch_times[0]]), self.bunch_times[where_gaps]), axis=None)
+        else:
+            # No trains
+            self.train_times = np.array([self.bunch_times[0]])
 
 class InstabilityModel(SynchedEntry):
     """

@@ -826,7 +826,10 @@ class ECAApp:
 
     def _execute_fit(self, fit, model: ECModel, refit: bool, current: int, total: int) -> bool:
         """Execute a single fit and update progress."""
-        result = fit.fit(model, refit=refit)
+        try:
+            result = fit.fit(model, refit=refit)
+        except:
+            result = None
         self.progress_var.set(f"Fitting: {current+1}/{total}")
         self.root.update()
         return result is not None
