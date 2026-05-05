@@ -1292,11 +1292,15 @@ def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True
         search = {**search, fit.name+"_success": False}
     results = db.where(**search)
     for i, result in enumerate(results):
-        model = ECModel(db.db, result)
-        fit.fit(model, refit=refit)
-        if isinstance(db.db.storage, CachingMiddleware):
-            db.db.storage.flush()
-        if verbose: print("{:<3}/{} {}".format(i, len(results), "S" if fit._mget("success", model) else "F"), end="\r")
+        try:
+            model = ECModel(db.db, result)
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                fit.fit(model, refit=refit)
+            if isinstance(db.db.storage, CachingMiddleware):
+                db.db.storage.flush()
+            if verbose: print("{:<3}/{} {}".format(i, len(results), "S" if fit._mget("success", model) else "F"), end="\r")
+        except:
+            if verbose: print("Exceptional error in fit. A file may be missing.")
     if verbose: print("Done.        ")
 
 if __name__ == "__main__":
