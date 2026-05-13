@@ -5,7 +5,6 @@ EcA - Electron Cloud Analysis Job Runner
 
 For use with PyECLOUD.
 """
-
 import os, stat
 from subprocess import run as sp_run
 from datetime import datetime
@@ -32,9 +31,23 @@ class RunLocal(RunTarget):
     """
     TEMPLATE = """#!/bin/bash
 cd {folder}
+if [ -s "inputs.tgz" ]; then
+    echo "Unpacking inputs tarball"
+    tar -xzf inputs.tgz
+    rm inputs.tgz
+else
+    echo "No inputs tarball found, assuming inputs are unpaked."
+fi
+touch output.tgz
 export ECLOUD={ecloud}
 export PYTHONPATH=$ECLOUD:$ECLOUD/PyHEADTAIL:$ECLOUD/NAFFlib:$PYTHONPATH
 {python} {ecloud_main}
+# Remove the dummy output
+if [ -s "output.tgz" ]; then
+    rm output.tgz
+fi
+# Pack the outputs
+tar -czvf output.tgz *.mat *.h5 *.txt *.input *.beam
     """
 
     def __init__(self, job_folders: list[str], python: str = "python", ecloud: str = "./"):
@@ -81,14 +94,36 @@ class RunSLURM(RunLocal):
         self.name = datetime.now().strftime("%d%m%Y_%H") if submission_name is None else submission_name
         self.remote_folder = "/home/{}/{}/".format(self.username, self.name) if remote_folder is None else os.path.join(remote_folder, self.name)
         self.remote_folders = [os.path.join(self.remote_folder, os.path.basename(f)) for f in self.job_folders]
+        self.retrieve_folders = self.remote_folders.copy()
         self.include_files = []
+        self.ssh_options = []
 
     @staticmethod
-    def compress(destination: str, folders: list[str]):
-        for folder in folders:
-            sp_run([
-                "tar", "uf", destination, os.path.basename(folder)
-            ], cwd=os.path.abspath(os.path.join(folder, "..")))
+    def compress(destination: str, folders: list[str], redo: bool = False) -> list[str]:
+        print("Compressing simulation inputs.")
+        packed_inputs = []
+        for i, folder in enumerate(folders):
+            if not os.path.isdir(folder):
+                sp_run([
+                    "tar", "uf", destination, os.path.basename(folder)
+                ], cwd=os.path.abspath(os.path.dirname(folder)))
+            else:
+                # Compress the contents of the input
+                if (not os.path.exists(os.path.join(folder, "inputs.tgz"))) or redo:
+                    sp_run([
+                        "bash", "-c", "tar --exclude=\"run.sh\" -czvf inputs.tgz *" 
+                    ], cwd=os.path.abspath(folder))
+                # Add the compressed file to the transfer tar
+                sp_run([
+                    "tar", "uf", destination, os.path.join(os.path.basename(folder), "inputs.tgz")
+                ], cwd=os.path.abspath(os.path.join(folder, "..")))
+                sp_run([
+                    "tar", "uf", destination, os.path.join(os.path.basename(folder), "run.sh")
+                ], cwd=os.path.abspath(os.path.join(folder, "..")))
+                packed_inputs.append(os.path.join(os.path.abspath(folder), "inputs.tgz"))
+            print(f"{i}/{len(folders)}", end="\r")
+        print("Compressed.")
+        return packed_inputs
 
     def make_submit_script(self, upload_tarball: str) -> str:
         scripts = [self.make_script(r, os.path.join(os.path.abspath(f), "run.sh")) for r, f in zip(self.remote_folders, self.job_folders)]
@@ -104,21 +139,21 @@ class RunSLURM(RunLocal):
         tarball = os.path.abspath(os.path.join("./", self.name + ".tar"))
         upload_tarball = os.path.abspath(os.path.join(self.remote_folder, "..", os.path.basename(tarball)))
         submit_script = self.make_submit_script(upload_tarball)
-        RunSLURM.compress(tarball, self.job_folders + [submit_script] + self.include_files)
+        input_files = RunSLURM.compress(tarball, self.job_folders + [submit_script] + self.include_files)
         try:
+            print("Copying input files.")
             sp_run([
-                "scp", "-r", tarball, "{}@{}:{}".format(self.username, self.hostname, upload_tarball)
+                "scp", *self.ssh_options, "-r", tarball, "{}@{}:{}".format(self.username, self.hostname, upload_tarball)
             ])
+            print("Unpacking and submitting.")
             sp_run([
-                "ssh", "{}@{}".format(self.username, self.hostname),
-                "mkdir {}".format(self.remote_folder)
-            ])
-            sp_run([
-                "ssh", "{}@{}".format(self.username, self.hostname),
-                "tar -xf {} -C {} && {}".format(upload_tarball, self.remote_folder, os.path.join(self.remote_folder, os.path.basename(submit_script)))
+                "ssh", *self.ssh_options, "{}@{}".format(self.username, self.hostname),
+                f"$( [ -d {self.remote_folder} ] || mkdir {self.remote_folder} ) && tar -xf {upload_tarball} -C {self.remote_folder} && {os.path.join(self.remote_folder, os.path.basename(submit_script))}"
             ])
             os.remove(tarball)
             os.remove(submit_script)
+            for input_tar in input_files:
+                os.remove(input_tar)
         except Exception as e:
             print("Failed to submit jobs:", e)
 
@@ -133,31 +168,32 @@ folders=({})
 output="{}"
 for folder in "${{folders[@]}}"; do
     progress_file="$folder/progress"
-    if [[ -f "$progress_file" ]]; then
+    if [[ -s "$progress_file" ]]; then
         first_line=$(head -n 1 "$progress_file")
-        if [[ $(echo "$first_line > 0.99") ]]; then
+        if [[ $(echo "$first_line > 0.99") ]] && [ -s "output.tgz" ]; then
             cd "$folder/.."
-            tar -uf "$output" "$(basename $folder)"
+            tar -uf "$output" "$(basename $folder)/output.tgz"
         fi
     fi
 done""".format(
-            " ".join(["\"" + f + "\"" for f in self.remote_folders]), upload_tarball
+            " ".join(["\"" + f + "\"" for f in self.retrieve_folders]), upload_tarball
             ))
         s = os.stat(retrieve_script)
         os.chmod(retrieve_script, s.st_mode | stat.S_IEXEC)
         try:
             sp_run([
-                "scp", "-r", retrieve_script, "{}@{}:{}".format(self.username, self.hostname, remote_script)
+                "scp", *self.ssh_options, "-r", retrieve_script, "{}@{}:{}".format(self.username, self.hostname, remote_script)
             ])
             sp_run([
-                "ssh", "{}@{}".format(self.username, self.hostname),
+                "ssh", *self.ssh_options, "{}@{}".format(self.username, self.hostname),
                 remote_script
             ])
+            # TODO: Replace with XRDCP?
             sp_run([
-                "scp", "-r", "{}@{}:{}".format(self.username, self.hostname, upload_tarball), tarball
+                "scp", *self.ssh_options, "-r", "{}@{}:{}".format(self.username, self.hostname, upload_tarball), tarball
             ])
             sp_run([
-                "ssh", "{}@{}".format(self.username, self.hostname),
+                "ssh", *self.ssh_options, "{}@{}".format(self.username, self.hostname),
                 "rm {} {}".format(upload_tarball, remote_script)
             ])
             unpack_dir = os.path.join("/tmp", self.name)
@@ -175,6 +211,9 @@ done""".format(
                 sp_run([
                     "cp", "-ru", os.path.join(unpack_dir, finished) + "/.", self.job_folders[j]
                 ])
+                sp_run([
+                    "tar -xzf output.tgz && rm output.tgz"
+                ], cwd=self.job_folders[j])
             os.remove(tarball)
             sp_run([
                 "rm", "-rf", unpack_dir
@@ -192,37 +231,63 @@ class RunCondor(RunSLURM):
 universe = vanilla
 executable = $(dirname)/run.sh
 arguments = ""
-output = $(dirname)/htcondor.out
-error = $(dirname)/htcondor.err
-log = $(dirname)/htcondor.log
-transfer_output_files = ""
+output = {afs_root}/$(dirname)/condor_out.txt
+error = {afs_root}/$(dirname)/condor_err.txt
+log = {afs_root}/$(dirname)/condor_log.txt
+should_transfer_files = YES
+transfer_input_files = $(dirname)/inputs.tgz
+transfer_output_files = output.tgz
+output_destination = {output_dir}/$(dirname)
+when_to_transfer_output = ON_EXIT
+MY.XRDCP_CREATE_DIR = True
 +MaxRuntime = 518400
 queue dirname from {folder_listfile}"""
 
     def __init__(self, job_folders: list[str], python: str = "python", ecloud: str = "./",
-                submission_name: str | None = None, remote_folder: str | None = None, username: str | None = None, hostname: str = "lxplus.cern.ch"):
+                submission_name: str | None = None, remote_folder: str | None = None, eos_folder: str | None = None,
+                username: str | None = None, hostname: str = "lxplus.cern.ch"):
         if username is None:
             username = os.getlogin()
         if remote_folder is None:
             remote_folder = "/afs/cern.ch/work/{}/{}/".format(username[0], username)
         super().__init__(job_folders, python, ecloud, submission_name, remote_folder, username, hostname)
+        if eos_folder is None:
+            common_root = os.path.realpath(os.path.abspath(os.path.commonpath(job_folders)))
+            if common_root.startswith("/eos/project") or common_root.startswith("/eos/home"):
+                ishome = common_root.startswith("/eos/home")
+                eos_folder = f"root://eos{"home" if ishome else "project"}-{common_root[common_root.find("-")+1]}.cern.ch/{common_root}"
+                eos_rootdir = common_root
+                print("Determined the simulation source to already be on EOS, results will be stored to:", common_root)
+            else:
+                eos_folder = f"root://eoshome-{username[0]}.cern.ch//eos/user/{username[0]}/{username}/"
+                eos_rootdir = os.path.join(eos_folder[eos_folder.find("/eos/"):], self.name)
+                print("Finished simulations will be stored on EOS:", eos_rootdir)
+        self.eos_folder = eos_folder
+        if not os.path.exists(eos_rootdir):
+            os.mkdir(eos_rootdir)
+        self.retrieve_folders = [os.path.join(eos_rootdir, os.path.basename(f)) for f in self.remote_folders]
+        self.ssh_options = ["-o", "PubkeyAuthentication=no"]
 
     def make_submit_script(self, upload_tarball: str) -> str:
         for r, f in zip(self.remote_folders, self.job_folders):
             self.make_script(r, os.path.join(os.path.abspath(f), "run.sh"))
         folder_listfile = os.path.abspath("./folders.txt")
-        with open(folder_listfile, "w") as f:
-            f.write("\n".join(self.remote_folders))
+        with open(folder_listfile, mode="w") as f:
+            f.write("\n".join([os.path.relpath(rf, self.remote_folder) for rf in self.remote_folders]))
         sub_file = os.path.abspath("./htcondor.sub")
         with open(sub_file, "w") as f:
-            f.write(RunCondor.CONDOR_TEMPLATE.format(folder_listfile=os.path.join(self.remote_folder, os.path.basename(folder_listfile))))
+            f.write(RunCondor.CONDOR_TEMPLATE.format(
+                afs_root=self.remote_folder,
+                folder_listfile=os.path.basename(folder_listfile),
+                output_dir=self.eos_folder
+            ))
         submit_script = os.path.abspath("./" + self.name + "_submit.sh")
         with open(submit_script, "w") as f:
             f.write("""#!/bin/bash
-            cd {}
-            condor_submit htcondor.sub
-            condor_q --nobatch
-            rm {} {} {}
+cd {}
+condor_submit htcondor.sub
+condor_q --nobatch
+rm {} {} {}
             """.format(self.remote_folder, 
                        os.path.join(self.remote_folder, os.path.basename(folder_listfile)),
                        os.path.join(self.remote_folder, os.path.basename(sub_file)),
@@ -233,11 +298,28 @@ queue dirname from {folder_listfile}"""
         self.include_files = [folder_listfile, sub_file]
         return submit_script
 
+    def retrieve(self, verbose=True):
+        if verbose: print("Unpacking retrieved jobs in EOS:", self.eos_folder)
+        for i, retrieve_folder in enumerate(self.retrieve_folders):
+            output_tar = os.path.join(retrieve_folder, "output.tgz")
+            if os.path.exists(output_tar) and os.stat(output_tar).st_size > 0:
+                sp_run([
+                    "tar", "-xzf", "output.tgz"
+                ], cwd=retrieve_folder)
+                os.remove(output_tar)
+            print(f"{i}/{len(self.retrieve_folders)}", end="\r")
+        print("Done.")
+
 class RunCondorContainer(RunCondor):
     TEMPLATE = """#!/usr/bin/env bash
 cd {folder}
 CONTAINER_FULLPATH="{container_path}"
 echo $CONTAINER_FULLPATH
+cd $_CONDOR_SCRATCH_DIR
+# Extract the inputs
+tar -xzf inputs.tgz
+rm inputs.tgz
+touch output.tgz
 # Optional: Print node info
 echo "************************ NODE INFO *************************" 
 hostname -A
@@ -249,12 +331,17 @@ echo "********************** CONTAINER INFO **********************"
 apptainer exec --home "$_CONDOR_SCRATCH_DIR" --cleanenv $CONTAINER_FULLPATH bash -lc 'echo $ECLOUD_CONTAINER_VERSION'
 echo "******************** END CONTAINER INFO ********************"
 apptainer exec --env PYTHONNOUSERSITE=1 --home "$_CONDOR_SCRATCH_DIR" --writable-tmpfs --cleanenv $CONTAINER_FULLPATH python /home/eclouduser/PyCOMPLETE/PyECLOUD/main.py
+# Remove the dummy output
+rm output.tgz
+# Pack the outputs
+tar -czvf output.tgz Pyecltest.mat *.h5 *.txt
     """
 
     def __init__(self, job_folders: list[str], container_path: str = "/cvmfs/unpacked.cern.ch/ghcr.io/ekatralis/ecloud-containers:latest",
-                submission_name: str | None = None, remote_folder: str | None = None, username: str | None = None, hostname: str = "lxplus.cern.ch"):
+                submission_name: str | None = None, remote_folder: str | None = None, eos_folder: str | None = None,
+                username: str | None = None, hostname: str = "lxplus.cern.ch"):
         self.container_path = container_path
-        super().__init__(job_folders, "", "", submission_name, remote_folder, username, hostname)
+        super().__init__(job_folders, "python", "./", submission_name, remote_folder, eos_folder, username, hostname)
 
     def make_script(self, folder: str, output: None | str = None) -> str:
         """Create a shell script to run PyECLOUD"""

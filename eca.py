@@ -146,7 +146,7 @@ class TemplateSim(object):
                     value = values[prop]
                     if type(value) == str and os.path.exists(value) and os.path.isfile(value):
                         value = os.path.normpath(os.path.abspath(value))
-                        if os.path.commonpath((value, self.path)) == self.path:
+                        if os.path.commonpath((value, self.path)) != self.path:
                             # This is a filepath argument within the template. We also need this file.
                             rebase = os.path.join(path, os.path.basename(value))
                             copy2(value, rebase)
