@@ -3,6 +3,7 @@ from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.colors import Colormap, Normalize
 import matplotlib.gridspec as gridspec
+from scipy import signal as sp_signal
 import numpy as np
 from typing import Iterable
 
@@ -177,145 +178,509 @@ def histogram_plot(db: SimDB, param: str, bins: int | str = 'auto',
         ax.set_title(f"Histogram of {param}")
     return n, bins_out, patches
 
-def instability_grid_plot(db: SimDB, size: tuple[int, int] | None = (14, 16), save_path: str | None = None, **restrict):
+def instability_grid_plot(db: SimDB, size: tuple[int, int] | None = (14, 16), 
+                          save_path: str | None = None, max_plots: int = 5,
+                          colormap: None | Colormap = None,
+                          **restrict):
     """
-    Replicates the 8-panel grid from 001c_full_sims_bunch_evolution_rms.py.
-    Accepts a SimDB (InstabilityDB) and a restrict query.
-    Plots the first 5 matching simulations by default to avoid clutter, 
-    or all if fewer than 5.
+    Replicates the 8-panel grid with a fixed colorbar layout.
     """
-    # Fetch models matching the query
     results = db.where(**restrict)
     if len(results) == 0:
         print("No simulations found matching the restrict query.")
         return None
-    # Limit to first 5 for clarity, unless fewer exist
-    display_count = min(5, len(results))
+
+    display_count = min(max_plots, len(results))
     models = [InstabilityModel(db.db, r) for r in results[:display_count]]
+    
+    if colormap is None:
+        colormap = plt.cm.viridis
+    
+    # Check if ANY model has slice data to decide layout
+    has_slice_data = any(len(m.slice_mean_x) > 0 for m in models)
+    
+    # FIX: Use 3 columns. Col 0 & 1 for plots, Col 2 for colorbar.
+    n_rows = 3 if has_slice_data else 2
     fig = plt.figure(figsize=size)
-    gs = gridspec.GridSpec(4, 2)
-    # Define axes
-    ax_cent_x = fig.add_subplot(gs[0])
-    ax_cent_y = fig.add_subplot(gs[1], sharex=ax_cent_x)
-    ax_eps_x = fig.add_subplot(gs[2], sharex=ax_cent_x)
-    ax_eps_y = fig.add_subplot(gs[3], sharex=ax_cent_x)
-    ax_mp = fig.add_subplot(gs[4], sharex=ax_cent_x)
-    ax_sz = fig.add_subplot(gs[5], sharex=ax_cent_x)
-    ax_dummy1 = fig.add_subplot(gs[6], sharex=ax_cent_x)
-    ax_dummy2 = fig.add_subplot(gs[7], sharex=ax_cent_x)
-    colors = plt.cm.rainbow(np.linspace(0, 1, len(models)))
+    gs = gridspec.GridSpec(n_rows, 3, figure=fig, width_ratios=[1, 1, 0.15]) 
+    # width_ratios ensures the colorbar column is thin (15%) and plots are equal width
+    
+    # --- Create Axes ---
+    # Row 1: Centroids
+    ax_cent_x = fig.add_subplot(gs[0, 0])
+    ax_cent_y = fig.add_subplot(gs[0, 1], sharex=ax_cent_x, sharey=ax_cent_x)
+    
+    # Row 2: RMS (conditional) or Emittance
+    if has_slice_data:
+        ax_rms_x = fig.add_subplot(gs[1, 0], sharex=ax_cent_x)
+        ax_rms_y = fig.add_subplot(gs[1, 1], sharex=ax_cent_x)
+        row_emittance = 2
+        axes = {
+            'cent_x': ax_cent_x, 'cent_y': ax_cent_y,
+            'rms_x': ax_rms_x, 'rms_y': ax_rms_y,
+        }
+    else:
+        ax_rms_x = None
+        ax_rms_y = None
+        row_emittance = 1
+        axes = {
+            'cent_x': ax_cent_x, 'cent_y': ax_cent_y,
+        }
+    
+    # Row 3/2: Emittance
+    ax_eps_x = fig.add_subplot(gs[row_emittance, 0], sharex=ax_cent_x)
+    ax_eps_y = fig.add_subplot(gs[row_emittance, 1], sharex=ax_cent_x)
+    axes['eps_x'] = ax_eps_x
+    axes['eps_y'] = ax_eps_y
+    
+    # --- Plot Data ---
+    colors = colormap(np.linspace(0, 1, display_count))
     
     for i, model in enumerate(models):
         c = colors[i]
-        turns = np.arange(model.n_turns)
-        # 1. Centroids (Normalized)
-        if len(model.mean_x) > 0:
-            sigma_x = np.std(model.mean_x) if np.std(model.mean_x) > 0 else 1e-9
-            norm_x = (model.mean_x - np.mean(model.mean_x)) / sigma_x
-            ax_cent_x.plot(turns, norm_x, color=c, label=f'Sim {i}')
-        if len(model.mean_y) > 0:
-            sigma_y = np.std(model.mean_y) if np.std(model.mean_y) > 0 else 1e-9
-            norm_y = (model.mean_y - np.mean(model.mean_y)) / sigma_y
-            ax_cent_y.plot(turns, norm_y, color=c)
-        # 2. Emittance (Normalized)
+        n_turns = len(model.mean_x) if len(model.mean_x) > 0 else 0
+        if n_turns == 0:
+            continue
+        
+        turns = np.arange(n_turns)
+        
+        # 1. Centroids
+        if len(model.mean_x) > 0 and len(model.sigma_x) > 0:
+            sigma_x_init = model.sigma_x[0] if model.sigma_x[0] != 0 and np.isfinite(model.sigma_x[0]) else 1e-9
+            mask_x = np.isfinite(model.mean_x) & np.isfinite(model.sigma_x)
+            if np.any(mask_x):
+                centroid_x = model.mean_x - np.mean(model.mean_x[mask_x])
+                norm_x = centroid_x[mask_x] / sigma_x_init
+                ax_cent_x.plot(turns[mask_x], norm_x, color=c, label=f'Sim {i}' if i == 0 else "")
+        
+        if len(model.mean_y) > 0 and len(model.sigma_y) > 0:
+            sigma_y_init = model.sigma_y[0] if model.sigma_y[0] != 0 and np.isfinite(model.sigma_y[0]) else 1e-9
+            mask_y = np.isfinite(model.mean_y) & np.isfinite(model.sigma_y)
+            if np.any(mask_y):
+                centroid_y = model.mean_y - np.mean(model.mean_y[mask_y])
+                norm_y = centroid_y[mask_y] / sigma_y_init
+                ax_cent_y.plot(turns[mask_y], norm_y, color=c, 
+                              label=f'Sim {i}: σ_y={model.sigma_y[0]:.2e}' if i == 0 else "")
+        
+        # 2. Charge-Weighted RMS
+        if has_slice_data and ax_rms_x is not None:
+            if len(model.charge_weighted_rms_x) > 0:
+                rms_x = model.charge_weighted_rms_x
+                if len(rms_x) > 20:
+                    rms_x = sp_signal.savgol_filter(sp_signal.convolve(rms_x, sp_signal.windows.boxcar(20), mode='same') / 20, 21, 3)
+                mask_rms_x = np.isfinite(rms_x)
+                if np.any(mask_rms_x):
+                    ax_rms_x.plot(turns[mask_rms_x], rms_x[mask_rms_x], color=c)
+            
+            if len(model.slice_mean_y) > 0:
+                mean_y_slice = model.slice_mean_y
+                weights = model.slice_n_macroparticles
+                if mean_y_slice.shape == weights.shape:
+                    weighted_mean = np.sum(mean_y_slice * weights, axis=0) / (np.sum(weights, axis=0) + 1e-12)
+                    rms_y = np.sqrt(np.sum((mean_y_slice - weighted_mean)**2 * weights, axis=0) / (np.sum(weights, axis=0) + 1e-12))
+                    if len(rms_y) > 20:
+                        rms_y = sp_signal.savgol_filter(sp_signal.convolve(rms_y, sp_signal.windows.boxcar(20), mode='same') / 20, 21, 3)
+                    mask_rms_y = np.isfinite(rms_y)
+                    if np.any(mask_rms_y):
+                        ax_rms_y.plot(turns[mask_rms_y], rms_y[mask_rms_y], color=c)
+        
+        # 3. Normalized Emittance
         if len(model.epsn_x) > 0 and model.epsn_x[0] != 0:
-            ax_eps_x.plot(turns, model.epsn_x / model.epsn_x[0], color=c)
+            mask_eps_x = np.isfinite(model.epsn_x) & (model.epsn_x > 0)
+            if np.any(mask_eps_x):
+                eps_x_norm = model.epsn_x[mask_eps_x] / model.epsn_x[0]
+                ax_eps_x.plot(turns[mask_eps_x], eps_x_norm, color=c)
+        
         if len(model.epsn_y) > 0 and model.epsn_y[0] != 0:
-            ax_eps_y.plot(turns, model.epsn_y / model.epsn_y[0], color=c)
-        # 3. MP Count & Bunch Length
-        if len(model.macroparticlenumber) > 0:
-            ax_mp.plot(turns, model.macroparticlenumber, color=c)
-        if len(model.sigma_z) > 0:
-            # Convert to ns: sigma_z (m) / c * 4 * 1e9
-            c_light = 299792458.0
-            ax_sz.plot(turns, model.sigma_z * 4 / c_light * 1e9, color=c)
+            mask_eps_y = np.isfinite(model.epsn_y) & (model.epsn_y > 0)
+            if np.any(mask_eps_y):
+                eps_y_norm = model.epsn_y[mask_eps_y] / model.epsn_y[0]
+                ax_eps_y.plot(turns[mask_eps_y], eps_y_norm, color=c)
 
-    # Labels
-    ax_cent_x.set_ylabel('Norm. Centroid X')
-    ax_cent_y.set_ylabel('Norm. Centroid Y')
-    ax_eps_x.set_ylabel('Norm. Emittance X')
-    ax_eps_y.set_ylabel('Norm. Emittance Y')
-    ax_mp.set_ylabel('Macroparticles')
-    ax_sz.set_ylabel('Bunch Length (4σ) [ns]')
-    for ax in [ax_cent_x, ax_cent_y, ax_eps_x, ax_eps_y, ax_mp, ax_sz]:
+    # --- Formatting ---
+    labels = {
+        'cent_x': 'Horizontal Centroid / $\\sigma_x$',
+        'cent_y': 'Vertical Centroid / $\\sigma_y$',
+        'rms_x': 'Charge-weighted RMS X [a.u.]',
+        'rms_y': 'Charge-weighted RMS Y [a.u.]',
+        'eps_x': 'Norm. Emittance X / $\\epsilon_{x,0}$',
+        'eps_y': 'Norm. Emittance Y / $\\epsilon_{y,0}$',
+    }
+    
+    for key, ax in axes.items():
+        if ax is None: continue
         ax.grid(True, linestyle='--', alpha=0.5)
-        ax.ticklabel_format(style='sci', scilimits=(0,0), axis='y')
-    ax_mp.set_xlabel('Turns')
-    ax_sz.set_xlabel('Turns')
-    ax_cent_y.legend(loc='upper left', bbox_to_anchor=(1.05, 1))
-    plt.tight_layout()
+        ax.ticklabel_format(style='sci', scilimits=(0, 0), axis='y')
+        if key in labels:
+            ax.set_ylabel(labels[key], fontsize=11)
+        ax.set_xlabel('Turns', fontsize=11)
+
+    # FIX: Create colorbar using the GridSpec column
+    # We create a dummy scatter plot to generate the colorbar mapping
+    sm = plt.cm.ScalarMappable(cmap=colormap, norm=plt.Normalize(vmin=0, vmax=display_count-1))
+    sm.set_array([])
+    
+    # Create the colorbar axis from the GridSpec
+    cbar_ax = fig.add_subplot(gs[:, 2]) # Takes the full height of the 3rd column
+    cbar = plt.colorbar(sm, cax=cbar_ax)
+    cbar.set_label('Simulation Index', fontsize=11)
+    
+    # Title
+    title_parts = []
+    if len(results) > 0:
+        r = results[0]
+        if 'init_unif_edens_dip' in r:
+            title_parts.append(f"Density: {r['init_unif_edens_dip']:.2e}")
+        if 'element' in r:
+            title_parts.append(f"Element: {r['element']}")
+    
+    if title_parts:
+        fig.suptitle("Instability Evolution: " + " | ".join(title_parts), fontsize=14, y=0.995)
+        
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
     return fig
+
 
 def growth_rate_vs_density_plot(db: SimDB, density_key: str = 'init_unif_edens_dip', 
                                 growth_key: str = 'growth_rate_mode', 
                                 size: tuple[int, int] | None = (8, 6), 
-                                save_path: str | None = None, **restrict):
+                                save_path: str | None = None, 
+                                colormap: None | Colormap = None,
+                                **restrict):
     """
     Plots Growth Rate vs. Electron Density.
-    Accepts a SimDB and a restrict query.
+    Replicates 002b_growth_rate_most_unstable.py with improvements.
+    
+    Parameters:
+    -----------
+    db : SimDB
+        Database of instability models
+    density_key : str
+        Database key for electron density
+    growth_key : str
+        Database key for growth rate
+    size : tuple
+        Figure size
+    save_path : str
+        Path to save figure
+    colormap : Colormap
+        Color scheme (default: viridis)
+    **restrict : dict
+        Database query restrictions
     """
     ax = _axes(size)
+    
     results = db.where(**restrict)
     densities = []
     rates = []
+    
     for r in results:
         if density_key in r and growth_key in r:
             d = r[density_key]
             g = r[growth_key]
-            if isinstance(d, (int, float, np.number)) and isinstance(g, (int, float, np.number)) and not np.isnan(g):
-                densities.append(d)
-                rates.append(g)
-            
+            # FIX #8: Filter NaNs and invalid values
+            if isinstance(d, (int, float, np.number)) and isinstance(g, (int, float, np.number)):
+                if np.isfinite(g) and np.isfinite(d) and d > 0 and g > 0:
+                    densities.append(d)
+                    rates.append(g)
+    
     densities = np.array(densities)
     rates = np.array(rates)
+    
     if len(densities) > 0:
-        ax.semilogy(densities, rates, 'o-', linewidth=2, markersize=8)
-        ax.set_xlabel('Electron Density [$e^-/m^3$]')
-        ax.set_ylabel('Growth Rate [turn$^{-1}$]')
-        ax.grid(True, linestyle='dashed')
-        ax.set_xlim(left=0)
+        # Sort by density for clean line plot
+        sort_idx = np.argsort(densities)
+        densities = densities[sort_idx]
+        rates = rates[sort_idx]
+        
+        # FIX #6: Use colormap
+        if colormap is None:
+            colormap = plt.cm.viridis
+        
+        ax.semilogy(densities, rates, 'o-', linewidth=2.5, markersize=8, 
+                   color=colormap(0.7), label='Growth Rate')
+        ax.set_xlabel('Electron Density [$e^-/m^3$]', fontsize=12)
+        ax.set_ylabel('Growth Rate [turn$^{-1}$]', fontsize=12)
+        ax.grid(True, linestyle='--', alpha=0.5)
+        ax.set_xlim(left=min(densities)*0.9)
+        ax.legend()
     else:
-        ax.text(0.5, 0.5, "No valid data found", ha='center', va='center')
+        ax.text(0.5, 0.5, "No valid data found", ha='center', va='center', 
+               transform=ax.transAxes)
+        ax.set_xlabel(density_key)
+        ax.set_ylabel(growth_key)
+    
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=220)
+    
     return ax
+
 
 def blowup_time_vs_strength_plot(db: SimDB, strength_key: str = 'strength_factor', 
                                  turns_key: str = 'blowup_turn_first', 
                                  size: tuple[int, int] | None = (12, 10), 
-                                 save_path: str | None = None, **restrict):
+                                 save_path: str | None = None,
+                                 colormap: None | Colormap = None,
+                                 **restrict):
     """
     Plots Blow-up Time vs. Strength Factor.
-    Accepts a SimDB and a restrict query.
+    Replicates 002b_blowup_Turns_plot.py with improvements.
+    
+    Parameters:
+    -----------
+    db : SimDB
+        Database of instability models
+    strength_key : str
+        Database key for strength factor
+    turns_key : str
+        Database key for blowup turn
+    size : tuple
+        Figure size
+    save_path : str
+        Path to save figure
+    colormap : Colormap
+        Color scheme (default: viridis)
+    **restrict : dict
+        Database query restrictions
     """
     ax = _axes(size)
+    
     results = db.where(**restrict)
     strengths = []
     turns = []
+    
     for r in results:
         if strength_key in r and turns_key in r:
             s = r[strength_key]
             t = r[turns_key]
-            if isinstance(s, (int, float, np.number)) and isinstance(t, (int, float, np.number)) and not np.isnan(t):
-                strengths.append(s)
-                turns.append(t)    
+            # FIX #8: Filter NaNs and invalid values
+            if isinstance(s, (int, float, np.number)) and isinstance(t, (int, float, np.number)):
+                if np.isfinite(t) and np.isfinite(s) and s > 0:
+                    strengths.append(s)
+                    turns.append(t)
+    
     strengths = np.array(strengths)
     turns = np.array(turns)
     
     if len(strengths) > 0:
-        ax.semilogy(strengths, turns, 'o-', linewidth=3.5, markersize=10)
-        ax.axhline(y=20000, color='darkgreen', linestyle='--', linewidth=2, label='Limit')
-        ax.set_xlabel('Strength Factor')
-        ax.set_ylabel('Blow-up Time [Turns]')
-        ax.grid(True, linestyle='dashed')
-        ax.legend()
+        sort_idx = np.argsort(strengths)
+        strengths = strengths[sort_idx]
+        turns = turns[sort_idx]
+        
+        # FIX #6: Use colormap
+        if colormap is None:
+            colormap = plt.cm.viridis
+        
+        ax.semilogy(strengths, turns, 'o-', linewidth=3.5, markersize=10, 
+                   color=colormap(0.7), label='Blowup Time')
+        
+        # Draw limit line (e.g., 20000 turns)
+        max_turns = np.nanmax(turns) if len(turns) > 0 else 20000
+        limit = 20000
+        if limit < max_turns:
+            ax.axhline(y=limit, color='darkgreen', linestyle='--', linewidth=2.5, label='Target Limit')
+            ax.legend(fontsize=11)
+        
+        ax.set_xlabel('Strength Factor', fontsize=12)
+        ax.set_ylabel('Blow-up Time [Turns]', fontsize=12)
+        ax.grid(True, linestyle='--', alpha=0.5)
+        ax.set_xlim(left=min(strengths)*0.9)
     else:
-        ax.text(0.5, 0.5, "No valid data found", ha='center', va='center')
+        ax.text(0.5, 0.5, "No valid data found", ha='center', va='center', 
+               transform=ax.transAxes)
+        ax.set_xlabel(strength_key)
+        ax.set_ylabel(turns_key)
     
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=300)
+    
     return ax
+
+
+def intrabunch_mode_heatmap(db: SimDB, model_idx: int = 0, 
+                            size: tuple[int, int] | None = (10, 6),
+                            save_path: str | None = None,
+                            colormap: None | Colormap = None,
+                            **restrict):
+    """
+    Plots the intra-bunch mode structure (Slice vs Turn) heatmap.
+    Similar to 003_intrabunch_modes.py.
+    
+    Parameters:
+    -----------
+    db : SimDB
+        Database of instability models
+    model_idx : int
+        Index of model to plot
+    size : tuple
+        Figure size
+    save_path : str
+        Path to save figure
+    colormap : Colormap
+        Color scheme (default: RdBu_r)
+    **restrict : dict
+        Database query restrictions
+    """
+    results = db.where(**restrict)
+    if len(results) == 0:
+        print("No simulations found.")
+        return None
+    
+    if model_idx >= len(results):
+        model_idx = len(results) - 1
+    
+    model = InstabilityModel(db.db, results[model_idx])
+    
+    if len(model.slice_mean_x) == 0:
+        print("No slice data available for this simulation.")
+        return None
+    
+    if colormap is None:
+        colormap = plt.cm.RdBu_r
+    
+    fig, ax = plt.subplots(figsize=size)
+    
+    # Data: (slices, turns)
+    # FIX #3: Validate shapes before using
+    if model.slice_mean_x.ndim != 2:
+        print("Slice data has unexpected shape.")
+        return None
+    
+    signal = model.slice_mean_x
+    
+    # Optionally weight by macroparticles
+    if len(model.slice_n_macroparticles) > 0 and model.slice_n_macroparticles.shape == signal.shape:
+        weights = model.slice_n_macroparticles
+        signal = signal * weights / (np.mean(weights) + 1e-12)
+    
+    # Normalize for better visualization
+    signal_max = np.max(np.abs(signal))
+    if signal_max > 0:
+        signal_norm = signal / signal_max
+    else:
+        signal_norm = signal
+    
+    # Create meshgrid
+    n_slices, n_turns = signal.shape
+    z_axis = np.linspace(-1, 1, n_slices)  # Approximate z position (normalized)
+    t_axis = np.arange(n_turns)
+    
+    # Plot heatmap
+    im = ax.pcolormesh(t_axis, z_axis, signal_norm, shading='auto', cmap=colormap)
+    
+    ax.set_xlabel('Turns', fontsize=12)
+    ax.set_ylabel('Longitudinal Position (Normalized)', fontsize=12)
+    ax.set_title(f'Intra-bunch Mode Structure (Sim {model_idx})', fontsize=13)
+    
+    cbar = plt.colorbar(im, ax=ax, label='Normalized Signal')
+    ax.grid(True, linestyle='--', alpha=0.3)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+    
+    return fig
+
+def instability_mode_evolution_plot(db: SimDB, model_idx: int = 0, 
+                                    size: tuple[int, int] | None = (12, 8),
+                                    save_path: str | None = None,
+                                    colormap: None | Colormap = None,
+                                    **restrict):
+    """
+    Plots the evolution of intra-bunch modes over time (Spectrogram).
+    Highlights the dominant mode and its growth trajectory.
+    
+    Parameters:
+    -----------
+    db : SimDB
+        Database of instability models
+    model_idx : int
+        Index of the specific simulation to plot
+    size : tuple
+        Figure size
+    save_path : str
+        Path to save figure
+    colormap : Colormap
+        Color scheme (default: 'viridis')
+    **restrict : dict
+        Database query restrictions
+    """
+    results = db.where(**restrict)
+    if len(results) == 0:
+        print("No simulations found matching the query.")
+        return None
+    
+    if model_idx >= len(results):
+        model_idx = len(results) - 1
+    
+    model = InstabilityModel(db.db, results[model_idx])
+    
+    # Trigger calculation
+    power = model.slice_fft_power
+    if len(power) == 0:
+        print("No slice data or FFT calculation failed.")
+        return None
+    
+    dominant_idx = model.dominant_mode_idx
+    growth_rate = getattr(model, 'dominant_mode_growth_rate', np.nan)
+    
+    if colormap is None:
+        colormap = plt.cm.viridis
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=size, gridspec_kw={'height_ratios': [3, 1]})
+    
+    # --- Top: Spectrogram (Mode Power vs Time) ---
+    # Power shape: (Freq_Bins, Turns)
+    # We transpose to (Turns, Freq_Bins) for pcolormesh
+    turns = np.arange(power.shape[1])
+    # Approximate frequency axis (fractional tune)
+    # Assuming window size 64, freqs = k/64
+    freqs = np.arange(power.shape[0]) / 64.0 
+    
+    # Normalize for visualization
+    power_norm = np.log10(power + 1e-12)
+    
+    im = ax1.pcolormesh(turns, freqs, power_norm.T[:-1,:-1], shading='auto', cmap=colormap)
+    ax1.set_ylabel('Fractional Tune (Mode Index / 64)', fontsize=12)
+    ax1.set_xlabel('Turns', fontsize=12)
+    ax1.set_title(f'Mode Evolution (Sim {model_idx}) - Growth Rate: {growth_rate:.4f} turn⁻¹', fontsize=13)
+    
+    # Highlight dominant mode
+    if dominant_idx > 0 and dominant_idx < len(freqs):
+        ax1.axhline(y=freqs[dominant_idx], color='white', linestyle='--', 
+                    linewidth=2, label=f'Dominant Mode (idx={dominant_idx})')
+        ax1.legend(loc='upper right')
+    
+    cbar = plt.colorbar(im, ax=ax1, label='Log Power (a.u.)')
+    ax1.grid(True, linestyle='--', alpha=0.3, axis='x')
+    
+    # --- Bottom: Dominant Mode Growth ---
+    if dominant_idx > 0:
+        dom_power = power[dominant_idx, :]
+        # Smooth for visibility
+        if len(dom_power) > 20:
+            dom_power_smooth = sp_signal.savgol_filter(dom_power, 21, 3)
+        else:
+            dom_power_smooth = dom_power
+            
+        ax2.semilogy(turns, dom_power_smooth, 'r-', linewidth=2, label='Dominant Mode Power')
+        ax2.set_xlabel('Turns', fontsize=12)
+        ax2.set_ylabel('Mode Power (a.u.)', fontsize=12)
+        ax2.set_title(f'Dominant Mode Growth (Idx={dominant_idx})', fontsize=12)
+        ax2.grid(True, linestyle='--', alpha=0.5)
+        ax2.legend()
+    else:
+        ax2.text(0.5, 0.5, "No dominant mode detected", ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_xlim(0, 1)
+        ax2.set_ylim(0, 1)
+        ax2.axis('off')
+
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    return fig
