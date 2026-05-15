@@ -15,6 +15,7 @@ from tinydb.storages import MemoryStorage, JSONStorage
 from tinydb.table import Document
 from tinydb.middlewares import CachingMiddleware
 from shutil import copy2
+from glob import glob
 
 import os
 
@@ -798,91 +799,286 @@ class ECModel(SynchedEntry):
 class InstabilityModel(SynchedEntry):
     """
     An InstabilityModel corresponds to one PyHEADTAIL instability simulation.
+    Extends SynchedEntry to auto-save analysis results (growth rates, blow-up times) to the DB.
+    Handles multi-partition .h5 files (e.g., bunch_evolution_00.h5, bunch_evolution_01.h5).
     """
     PROPERTIES: set[str] = {
-        "data_files",       # Map of data contained in .h5 files: {filename: {propA: n.entries, propB: {subpropA: n.entries}}}
-        "bunch_data_file",   # The data file where bunch evolution is stored
-        "slice_data_file"   # The data file where slice evolution is stored
+        "data_files",           # Map of .h5 files found
+        "bunch_data_file",      # Path to the primary bunch evolution file (merged)
+        "slice_data_file",      # Path to the primary slice evolution file (merged)
+        "n_turns",              # Total number of turns
+        "growth_rate_centroid", # Calculated growth rate from centroid fit
+        "growth_rate_mode",     # Calculated growth rate of dominant mode
+        "dominant_mode_idx",    # Index of dominant mode in FFT
+        "tune_centroid",        # Approximate tune from centroid FFT
+        "blowup_turn_first",    # Turn where emittance crosses threshold
+        "blowup_turn_last",     # Last turn of simulation
+        "max_emittance_ratio",  # Max ratio of final/initial emittance
+        "mean_x",               # Loaded mean_x array (cached)
+        "mean_y",               # Loaded mean_y array
+        "epsn_x",               # Loaded epsn_x array
+        "epsn_y",               # Loaded epsn_y array
+        "sigma_z",              # Loaded sigma_z array
+        "macroparticlenumber",  # Loaded MP count
     }
-    BUNCH_EVOLUTION = "bunch_evolution"
-    SLICE_EVOLUTION = "slice_evolution"
+
+    BUNCH_EVOLUTION_PATTERN = "bunch_evolution*.h5"
+    SLICE_EVOLUTION_PATTERN = "slice_evolution*.h5"
     _h5 = None
 
     def __init__(self, db: TinyDB | SimDB, doc: int | Document):
+        # Lazy load h5py to avoid import errors if not needed
         if InstabilityModel._h5 is None:
-            InstabilityModel._h5 = __import__("h5py")
+            import h5py
+            InstabilityModel._h5 = h5py
         result = doc if isinstance(doc, Document) else (db if isinstance(db, TinyDB) else db.db).get(doc_id=doc)
-        if result is None: raise KeyError("The provided doc_id={} does not exist in the database!".format(doc))
+        if result is None: 
+            raise KeyError(f"The provided doc_id={doc} does not exist in the database!")
         super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, InstabilityModel.PROPERTIES)
-        # Populate this object with information from the database entry
+        self.doc_id = result.doc_id
+        # Populate from DB
         for k, v in result.items():
             self.set_sync(k)
-            if isinstance(v, list) and len(v) > 0 and not type(v[0]) == str:
-                setattr(self, "_"+k, np.array(v, dtype=type(v[0])))
+            # Handle list conversion for numpy arrays if stored as lists
+            if isinstance(v, list) and len(v) > 0 and not isinstance(v[0], str):
+                setattr(self, "_" + k, np.array(v, dtype=type(v[0])))
             else:
-                setattr(self, "_"+k, v)
+                setattr(self, "_" + k, v)
 
-    def _sync_get(self, attr: str):
-        if not hasattr(self, "_"+attr):
-            if hasattr(self, "gen_"+attr):
-                # Call the attribute's generator
-                getattr(self, "gen_"+attr)()
-            else:
-                raise ValueError("Requested synced property {} for which no generator is defined!".format(attr))
-        return super()._sync_get(attr)
-    
-    def gen_data_files(self):
+    def _load_h5_files(self, file_pattern: str, key: str = 'Bunch') -> dict[str, np.ndarray]:
         """
-        Data files are the .hdf5 files produced by instability simulations.
+        Loads and concatenates multiple .h5 files matching a pattern.
+        Handles sequential parts (00, 01, ...) and transposes if necessary.
+        Returns a dictionary of concatenated arrays.
         """
-        self.data_files = {}
-        for path in [os.path.join(self.path, f) for f in os.listdir(self.path) if f.endswith(".h5")]:
-            with self._h5.File(path, "r") as f:
-                self.data_files[path] = {}
-                for k in f.keys():
-                    if isinstance(f[k], self._h5.Group):
-                        self.data_files[path][k] = {kk: len(f[k][kk]) for kk in f[k].keys()}
+        # Find all matching files in the simulation folder
+        pattern_path = os.path.join(self.path, file_pattern)
+        files = sorted(glob(pattern_path))
+        if not files:
+            return {}
+        data_dict = {}
+        first_file = True
+        for f_path in files:
+            try:
+                with self._h5.File(f_path, 'r') as fid:
+                    # Determine if we need to look inside a group (e.g., 'Bunch' or 'Slices')
+                    if key in fid:
+                        group = fid[key]
                     else:
-                        self.data_files[path][k] = len(f[k])
+                        # Fallback: assume root level keys are the data
+                        group = fid
+                    current_data = {}
+                    for k in group.keys():
+                        val = np.array(group[k])
+                        # Handle scalar vs array
+                        if val.shape == ():
+                            val = val.item()
+                        current_data[k] = val
+                    if first_file:
+                        data_dict = {k: [v] for k, v in current_data.items()}
+                        first_file = False
+                    else:
+                        for k, v in current_data.items():
+                            if k in data_dict:
+                                # Concatenate along the first axis (turns)
+                                # Handle case where data might be 1D or 2D
+                                if isinstance(data_dict[k][0], np.ndarray):
+                                    data_dict[k].append(v)
+                                else:
+                                    # If it's a scalar, we can't concatenate, skip or overwrite?
+                                    # Usually scalars are constant, so we ignore subsequent ones
+                                    pass
+            except Exception as e:
+                print(f"Warning: Failed to load {f_path}: {e}")
+                continue
+        # Concatenate lists into final arrays
+        final_data = {}
+        for k, list_of_arrays in data_dict.items():
+            if len(list_of_arrays) == 1:
+                final_data[k] = list_of_arrays[0]
+            else:
+                # Stack along axis 0 (turns)
+                try:
+                    final_data[k] = np.concatenate(list_of_arrays, axis=0)
+                except ValueError:
+                    # Fallback if shapes don't match perfectly (rare)
+                    final_data[k] = np.array(list_of_arrays) # Keep as object array if mismatch
+        return final_data
 
-    def gen_bunch_data_file(self):
+    @property
+    def data(self) -> dict[str, np.ndarray]:
         """
-        The bunch data file is the primary instability output.
+        Lazy-loaded property containing all merged simulation data.
         """
-        self.bunch_data_file = None
-        for path in self.data_files:
-            if os.path.basename(path).lower().find(self.BUNCH_EVOLUTION) > -1:
-                self.bunch_data_file = path
+        if not hasattr(self, "_data_cache"):
+            self._data_cache = {}
+            # Load Bunch Evolution
+            # Pattern matches: bunch_evolution.h5 OR bunch_evolution_00.h5, bunch_evolution_01.h5
+            bunch_files = self._load_h5_files(InstabilityModel.BUNCH_EVOLUTION_PATTERN, key='Bunch')
+            if bunch_files:
+                self._data_cache.update(bunch_files)
+                self.bunch_data_file = list(bunch_files.keys())[0] # Store reference to first file
+            # Load Slice Evolution
+            slice_files = self._load_h5_files(InstabilityModel.SLICE_EVOLUTION_PATTERN, key='Slices')
+            if slice_files:
+                self._data_cache.update(slice_files)
+                self.slice_data_file = list(slice_files.keys())[0]
+            # If no data found, raise error
+            if not self._data_cache:
+                raise IOError(f"No .h5 data files found in {self.path}")
+        return self._data_cache
 
-    def gen_slice_data_file(self):
-        """
-        The slice data file is the primary instability output.
-        """
-        self.slice_data_file = None
-        for path in self.data_files:
-            if os.path.basename(path).lower().find(self.SLICE_EVOLUTION) > -1:
-                self.slice_data_file = path
+    def gen_n_turns(self):
+        """Total number of turns in the simulation."""
+        if 'mean_x' in self.data:
+            self.n_turns = len(self.data['mean_x'])
+        else:
+            self.n_turns = 0
 
-    def get_data(self, prop: str, filename: str | None = None, group: str | None = None) -> np.ndarray:
+    def gen_mean_x(self):
+        """Extract mean_x from data."""
+        if 'mean_x' in self.data:
+            self.mean_x = self.data['mean_x']
+        else:
+            self.mean_x = np.array([])
+
+    def gen_mean_y(self):
+        """Extract mean_y from data."""
+        if 'mean_y' in self.data:
+            self.mean_y = self.data['mean_y']
+        else:
+            self.mean_y = np.array([])
+
+    def gen_epsn_x(self):
+        """Extract normalized emittance X."""
+        if 'epsn_x' in self.data:
+            self.epsn_x = self.data['epsn_x']
+        else:
+            self.epsn_x = np.array([])
+
+    def gen_epsn_y(self):
+        """Extract normalized emittance Y."""
+        if 'epsn_y' in self.data:
+            self.epsn_y = self.data['epsn_y']
+        else:
+            self.epsn_y = np.array([])
+
+    def gen_sigma_z(self):
+        """Extract bunch length."""
+        if 'sigma_z' in self.data:
+            self.sigma_z = self.data['sigma_z']
+        else:
+            self.sigma_z = np.array([])
+
+    def gen_macroparticlenumber(self):
+        """Extract macroparticle count."""
+        if 'macroparticlenumber' in self.data:
+            self.macroparticlenumber = self.data['macroparticlenumber']
+        else:
+            self.macroparticlenumber = np.array([])
+
+    def gen_growth_rate_centroid(self):
         """
-        Read data from a data file.
-        If the HDF5 file contains more than one group, it can be specified.
+        Calculates the growth rate of the centroid oscillation.
+        Fits log(|mean_x|) to a line for the rising portion.
         """
-        if filename is None:
-            if self.bunch_data_file is None:
-                raise ValueError("Specify bunch_data_file before calling get_data with one argument.")
-            filename = self.bunch_data_file
-        if not filename in self.data_files:
-            for path in self.data_files.keys():
-                if os.path.basename(path) == os.path.basename(str(filename)):
-                    filename = path
-                    break
-        with self._h5.File(filename, "r") as f:
-            if group is None:
-                if prop in self.data_files[filename]:
-                    return f.get(prop)[:]
-                return f[tuple(self.data_files[filename].keys())[0]].get(prop)[:]
-            return f[group].get(prop)[:]
+        if not hasattr(self, 'mean_x') or len(self.mean_x) < 10:
+            self.growth_rate_centroid = np.nan
+            return
+        x = self.mean_x
+        turns = np.arange(len(x))
+        # Filter out zeros/negatives for log
+        mask = np.abs(x) > 1e-12
+        if np.sum(mask) < 10:
+            self.growth_rate_centroid = np.nan
+            return
+        # Fit log(|x|) = a*t + b -> growth rate = a
+        try:
+            coeffs = np.polyfit(turns[mask], np.log(np.abs(x[mask])), 1)
+            self.growth_rate_centroid = coeffs[0]
+        except Exception:
+            self.growth_rate_centroid = np.nan
+
+    def gen_dominant_mode_idx(self):
+        """
+        Finds the index of the dominant frequency in the centroid FFT.
+        """
+        if not hasattr(self, 'mean_x') or len(self.mean_x) < 2:
+            self.dominant_mode_idx = 0
+            return
+        fft_x = np.fft.rfft(self.mean_x)
+        power = np.abs(fft_x[1:])**2 # Exclude DC
+        if len(power) == 0:
+            self.dominant_mode_idx = 0
+            return
+        idx = np.argmax(power) + 1
+        self.dominant_mode_idx = idx
+
+    def gen_tune_centroid(self):
+        """
+        Estimates the tune from the dominant frequency.
+        Tune = freq * N_turns (normalized to 0.5 Nyquist)
+        Actually: freq in rfftfreq is cycles per turn.
+        """
+        if not hasattr(self, 'mean_x') or len(self.mean_x) < 2:
+            self.tune_centroid = 0.0
+            return
+
+        freqs = np.fft.rfftfreq(len(self.mean_x))
+        idx = self.dominant_mode_idx
+        if idx < len(freqs):
+            self.tune_centroid = freqs[idx]
+        else:
+            self.tune_centroid = 0.0
+
+    def gen_growth_rate_mode(self):
+        """
+        Estimates growth rate of the dominant mode.
+        Simplified: Uses the centroid growth rate as a proxy if mode isolation is complex.
+        For a more advanced version, one would isolate the mode via inverse FFT and fit.
+        """
+        # For now, proxy with centroid rate. 
+        # To improve: Filter FFT to dominant bin, inverse FFT, then fit envelope.
+        self.growth_rate_mode = self.growth_rate_centroid
+
+    def gen_blowup_turn_first(self):
+        """
+        Finds the first turn where emittance exceeds 1.2x initial value.
+        """
+        if not hasattr(self, 'epsn_x') or len(self.epsn_x) == 0:
+            self.blowup_turn_first = np.nan
+            return
+        initial = self.epsn_x[0]
+        threshold = initial * 1.2
+        mask = self.epsn_x > threshold
+        if np.any(mask):
+            self.blowup_turn_first = float(np.argmax(mask))
+        else:
+            self.blowup_turn_first = np.nan
+
+    def gen_max_emittance_ratio(self):
+        """Max ratio of emittance to initial."""
+        if not hasattr(self, 'epsn_x') or len(self.epsn_x) == 0:
+            self.max_emittance_ratio = 1.0
+            return
+        initial = self.epsn_x[0]
+        if initial == 0:
+            self.max_emittance_ratio = np.nan
+        else:
+            self.max_emittance_ratio = float(np.max(self.epsn_x) / initial)
+
+    def run_analysis(self):
+        """
+        Convenience method to trigger all generators.
+        Since properties are lazy-loaded via _sync_get, accessing them triggers calculation.
+        """
+        _ = self.n_turns
+        _ = self.growth_rate_centroid
+        _ = self.dominant_mode_idx
+        _ = self.tune_centroid
+        _ = self.blowup_turn_first
+        _ = self.max_emittance_ratio
+        return self
 
 class DataSelector(object):
     """

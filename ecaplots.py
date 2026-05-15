@@ -2,6 +2,7 @@ from eca import *
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.colors import Colormap, Normalize
+import matplotlib.gridspec as gridspec
 import numpy as np
 from typing import Iterable
 
@@ -175,3 +176,146 @@ def histogram_plot(db: SimDB, param: str, bins: int | str = 'auto',
         ax.set_ylabel("Count")
         ax.set_title(f"Histogram of {param}")
     return n, bins_out, patches
+
+def instability_grid_plot(db: SimDB, size: tuple[int, int] | None = (14, 16), save_path: str | None = None, **restrict):
+    """
+    Replicates the 8-panel grid from 001c_full_sims_bunch_evolution_rms.py.
+    Accepts a SimDB (InstabilityDB) and a restrict query.
+    Plots the first 5 matching simulations by default to avoid clutter, 
+    or all if fewer than 5.
+    """
+    # Fetch models matching the query
+    results = db.where(**restrict)
+    if len(results) == 0:
+        print("No simulations found matching the restrict query.")
+        return None
+    # Limit to first 5 for clarity, unless fewer exist
+    display_count = min(5, len(results))
+    models = [InstabilityModel(db.db, r) for r in results[:display_count]]
+    fig = plt.figure(figsize=size)
+    gs = gridspec.GridSpec(4, 2)
+    # Define axes
+    ax_cent_x = fig.add_subplot(gs[0])
+    ax_cent_y = fig.add_subplot(gs[1], sharex=ax_cent_x)
+    ax_eps_x = fig.add_subplot(gs[2], sharex=ax_cent_x)
+    ax_eps_y = fig.add_subplot(gs[3], sharex=ax_cent_x)
+    ax_mp = fig.add_subplot(gs[4], sharex=ax_cent_x)
+    ax_sz = fig.add_subplot(gs[5], sharex=ax_cent_x)
+    ax_dummy1 = fig.add_subplot(gs[6], sharex=ax_cent_x)
+    ax_dummy2 = fig.add_subplot(gs[7], sharex=ax_cent_x)
+    colors = plt.cm.rainbow(np.linspace(0, 1, len(models)))
+    
+    for i, model in enumerate(models):
+        c = colors[i]
+        turns = np.arange(model.n_turns)
+        # 1. Centroids (Normalized)
+        if len(model.mean_x) > 0:
+            sigma_x = np.std(model.mean_x) if np.std(model.mean_x) > 0 else 1e-9
+            norm_x = (model.mean_x - np.mean(model.mean_x)) / sigma_x
+            ax_cent_x.plot(turns, norm_x, color=c, label=f'Sim {i}')
+        if len(model.mean_y) > 0:
+            sigma_y = np.std(model.mean_y) if np.std(model.mean_y) > 0 else 1e-9
+            norm_y = (model.mean_y - np.mean(model.mean_y)) / sigma_y
+            ax_cent_y.plot(turns, norm_y, color=c)
+        # 2. Emittance (Normalized)
+        if len(model.epsn_x) > 0 and model.epsn_x[0] != 0:
+            ax_eps_x.plot(turns, model.epsn_x / model.epsn_x[0], color=c)
+        if len(model.epsn_y) > 0 and model.epsn_y[0] != 0:
+            ax_eps_y.plot(turns, model.epsn_y / model.epsn_y[0], color=c)
+        # 3. MP Count & Bunch Length
+        if len(model.macroparticlenumber) > 0:
+            ax_mp.plot(turns, model.macroparticlenumber, color=c)
+        if len(model.sigma_z) > 0:
+            # Convert to ns: sigma_z (m) / c * 4 * 1e9
+            c_light = 299792458.0
+            ax_sz.plot(turns, model.sigma_z * 4 / c_light * 1e9, color=c)
+
+    # Labels
+    ax_cent_x.set_ylabel('Norm. Centroid X')
+    ax_cent_y.set_ylabel('Norm. Centroid Y')
+    ax_eps_x.set_ylabel('Norm. Emittance X')
+    ax_eps_y.set_ylabel('Norm. Emittance Y')
+    ax_mp.set_ylabel('Macroparticles')
+    ax_sz.set_ylabel('Bunch Length (4σ) [ns]')
+    for ax in [ax_cent_x, ax_cent_y, ax_eps_x, ax_eps_y, ax_mp, ax_sz]:
+        ax.grid(True, linestyle='--', alpha=0.5)
+        ax.ticklabel_format(style='sci', scilimits=(0,0), axis='y')
+    ax_mp.set_xlabel('Turns')
+    ax_sz.set_xlabel('Turns')
+    ax_cent_y.legend(loc='upper left', bbox_to_anchor=(1.05, 1))
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    return fig
+
+def growth_rate_vs_density_plot(db: SimDB, density_key: str = 'init_unif_edens_dip', 
+                                growth_key: str = 'growth_rate_mode', 
+                                size: tuple[int, int] | None = (8, 6), 
+                                save_path: str | None = None, **restrict):
+    """
+    Plots Growth Rate vs. Electron Density.
+    Accepts a SimDB and a restrict query.
+    """
+    ax = _axes(size)
+    results = db.where(**restrict)
+    densities = []
+    rates = []
+    for r in results:
+        if density_key in r and growth_key in r:
+            d = r[density_key]
+            g = r[growth_key]
+            if isinstance(d, (int, float, np.number)) and isinstance(g, (int, float, np.number)) and not np.isnan(g):
+                densities.append(d)
+                rates.append(g)
+            
+    densities = np.array(densities)
+    rates = np.array(rates)
+    if len(densities) > 0:
+        ax.semilogy(densities, rates, 'o-', linewidth=2, markersize=8)
+        ax.set_xlabel('Electron Density [$e^-/m^3$]')
+        ax.set_ylabel('Growth Rate [turn$^{-1}$]')
+        ax.grid(True, linestyle='dashed')
+        ax.set_xlim(left=0)
+    else:
+        ax.text(0.5, 0.5, "No valid data found", ha='center', va='center')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=220)
+    return ax
+
+def blowup_time_vs_strength_plot(db: SimDB, strength_key: str = 'strength_factor', 
+                                 turns_key: str = 'blowup_turn_first', 
+                                 size: tuple[int, int] | None = (12, 10), 
+                                 save_path: str | None = None, **restrict):
+    """
+    Plots Blow-up Time vs. Strength Factor.
+    Accepts a SimDB and a restrict query.
+    """
+    ax = _axes(size)
+    results = db.where(**restrict)
+    strengths = []
+    turns = []
+    for r in results:
+        if strength_key in r and turns_key in r:
+            s = r[strength_key]
+            t = r[turns_key]
+            if isinstance(s, (int, float, np.number)) and isinstance(t, (int, float, np.number)) and not np.isnan(t):
+                strengths.append(s)
+                turns.append(t)    
+    strengths = np.array(strengths)
+    turns = np.array(turns)
+    
+    if len(strengths) > 0:
+        ax.semilogy(strengths, turns, 'o-', linewidth=3.5, markersize=10)
+        ax.axhline(y=20000, color='darkgreen', linestyle='--', linewidth=2, label='Limit')
+        ax.set_xlabel('Strength Factor')
+        ax.set_ylabel('Blow-up Time [Turns]')
+        ax.grid(True, linestyle='dashed')
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, "No valid data found", ha='center', va='center')
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+    return ax
