@@ -332,10 +332,12 @@ echo "********************** CONTAINER INFO **********************"
 apptainer exec --home "$_CONDOR_SCRATCH_DIR" --cleanenv $CONTAINER_FULLPATH bash -lc 'echo $ECLOUD_CONTAINER_VERSION'
 echo "******************** END CONTAINER INFO ********************"
 apptainer exec --env PYTHONNOUSERSITE=1 --home "$_CONDOR_SCRATCH_DIR" --writable-tmpfs --cleanenv $CONTAINER_FULLPATH python /home/eclouduser/PyCOMPLETE/PyECLOUD/main.py
-# Remove the dummy output
-rm output.tgz
-# Pack the outputs
-tar -czvf output.tgz Pyecltest.mat *.h5 *.txt
+if [[ $? -eq 0 ]]; then
+    # Remove the dummy output
+    rm output.tgz
+    # Pack the outputs
+    tar -czvf output.tgz Pyecltest.mat *.h5 *.txt
+fi
     """
 
     def __init__(self, job_folders: list[str], container_path: str = "/cvmfs/unpacked.cern.ch/ghcr.io/ekatralis/ecloud-containers:latest",

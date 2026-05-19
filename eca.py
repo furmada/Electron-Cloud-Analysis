@@ -1765,62 +1765,37 @@ class FurmanPhotoFit(FurmanBaseFit):
             self._mset("success", False, model)
             setattr(model, f"_{self.name}_fitting_error", "Cannot fit photoemission model for non-buildup simulation.")
             return None
-
         xdata, ydata = self.select_data(model)
         scale_x, scale_y = self.scale_factor(model, xdata, ydata)
-        
         X = xdata * scale_x
         Y = ydata * scale_y
         self.fix({"y0": Y[0]})
-        
         # --- Intelligent Parameter Extraction Track ---
         dX = np.diff(X)
         dY = np.diff(Y)
         dYdX = dY / np.where(dX == 0, 1e-12, dX)
+        max_dydx = np.max(dYdX)
         Y_mid = 0.5 * (Y[:-1] + Y[1:])
-        
-        mask = (Y_mid < np.max(Y) * 0.92) & (dYdX > np.max(dYdX) * 0.02)
         alpha_init = model.k_pe_st * scipy.constants.c * model.b_spac * 0.1
-        beta_init = 0.1
+        beta_init = max_dydx / max(Y[0] * (np.max(Y) - Y[0]), 1e-12)
         yc_init = self.limit_estimate(xdata, ydata) * scale_y
-        
-        if np.sum(mask) >= 6:
-            try:
-                a, b, c = np.polyfit(Y_mid[mask], dYdX[mask], 2)
-                if a < 0:
-                    beta_init = -a
-                    yc_init = b / beta_init
-                    alpha_init = max(c, 1e-8)
-            except (np.linalg.LinAlgError, ValueError):
-                pass
 
-        np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
-        if np_result is None:
-            self._mset("success", False, model)
-            setattr(model, f"_{self.name}_fitting_error", "The underlying NoPhoto fit failed.")
-            return None
-            
-        yc_baseline, beta_baseline = np_result[0, 0], np_result[0, 1]
         alpha_max = model.k_pe_st * scipy.constants.c * model.b_spac
-
-        # --- Dynamic Bound Pinning ---
         self.bound({
-            "yc": (Y[0], max(yc_init * 3.0, yc_baseline * 3.0, np.max(Y) * 5.0)),
+            "yc": (Y[0], max(yc_init * 3.0, np.max(Y) * 5.0)),
             "alpha": (0.0, max(alpha_max, alpha_init * 10.0, 1.0)),
-            "beta": (0.0, max(beta_baseline * 5, beta_init * 5, 10))
+            "beta": (0.0, max(2*beta_init, 100))
         })
-        
         self.initial({
-            "yc": max(yc_init, yc_baseline, np.max(Y) * 1.05),
+            "yc": max(yc_init, np.max(Y) * 1.05),
             "alpha": min(alpha_init, alpha_max * 0.9) if alpha_max > 0 else alpha_init,
-            "beta": min(beta_init, beta_baseline)
+            "beta": beta_init
         })
         
         # Cache the readable tracking function
         original_compiled_fn = self._compiled_fn
         # Force the base class to look at the robust exponential version during optimization
         self._compiled_fn = self._compiled_opt_fn
-        
         try:
             # Executes Fit.fit() using the stable math block
             result = super().fit(model, refit)
