@@ -106,20 +106,20 @@ class RunSLURM(RunLocal):
             if not os.path.isdir(folder):
                 sp_run([
                     "tar", "uf", destination, os.path.basename(folder)
-                ], cwd=os.path.abspath(os.path.dirname(folder)))
+                ], cwd=os.path.abspath(os.path.dirname(folder)), capture_output=True)
             else:
                 # Compress the contents of the input
                 if (not os.path.exists(os.path.join(folder, "inputs.tgz"))) or redo:
                     sp_run([
                         "bash", "-c", "tar --exclude=\"run.sh\" -czvf inputs.tgz *" 
-                    ], cwd=os.path.abspath(folder))
+                    ], cwd=os.path.abspath(folder), capture_output=True)
                 # Add the compressed file to the transfer tar
                 sp_run([
                     "tar", "uf", destination, os.path.join(os.path.basename(folder), "inputs.tgz")
-                ], cwd=os.path.abspath(os.path.join(folder, "..")))
+                ], cwd=os.path.abspath(os.path.join(folder, "..")), capture_output=True)
                 sp_run([
                     "tar", "uf", destination, os.path.join(os.path.basename(folder), "run.sh")
-                ], cwd=os.path.abspath(os.path.join(folder, "..")))
+                ], cwd=os.path.abspath(os.path.join(folder, "..")), capture_output=True)
                 packed_inputs.append(os.path.join(os.path.abspath(folder), "inputs.tgz"))
             print(f"{i}/{len(folders)}", end="\r")
         print("Compressed.")
@@ -144,14 +144,15 @@ class RunSLURM(RunLocal):
             print("Copying input files.")
             sp_run([
                 "scp", *self.ssh_options, "-r", tarball, "{}@{}:{}".format(self.username, self.hostname, upload_tarball)
-            ])
+            ], capture_output=True).check_returncode()
             print("Unpacking and submitting.")
-            sp_run([
+            result = sp_run([
                 "ssh", *self.ssh_options, "{}@{}".format(self.username, self.hostname),
                 f"$( [ -d {self.remote_folder} ] || mkdir {self.remote_folder} ) && tar -xf {upload_tarball} -C {self.remote_folder} && {os.path.join(self.remote_folder, os.path.basename(submit_script))}"
-            ])
+            ], capture_output=True)
             os.remove(tarball)
             os.remove(submit_script)
+            result.check_returncode()
             for input_tar in input_files:
                 os.remove(input_tar)
         except Exception as e:
@@ -183,25 +184,25 @@ done""".format(
         try:
             sp_run([
                 "scp", *self.ssh_options, "-r", retrieve_script, "{}@{}:{}".format(self.username, self.hostname, remote_script)
-            ])
+            ], capture_output=True)
             sp_run([
                 "ssh", *self.ssh_options, "{}@{}".format(self.username, self.hostname),
                 remote_script
-            ])
+            ], capture_output=True)
             # TODO: Replace with XRDCP?
             sp_run([
                 "scp", *self.ssh_options, "-r", "{}@{}:{}".format(self.username, self.hostname, upload_tarball), tarball
-            ])
+            ], capture_output=True)
             sp_run([
                 "ssh", *self.ssh_options, "{}@{}".format(self.username, self.hostname),
                 "rm {} {}".format(upload_tarball, remote_script)
-            ])
+            ], capture_output=True)
             unpack_dir = os.path.join("/tmp", self.name)
             if not os.path.exists(unpack_dir):
                 os.mkdir(unpack_dir)
             sp_run([
                 "tar", "xf", tarball, "-C", unpack_dir
-            ])
+            ], capture_output=True)
             j = 0
             for finished in list(sorted(os.listdir(unpack_dir))):
                 while finished != os.path.basename(self.job_folders[j]):
@@ -210,14 +211,14 @@ done""".format(
                         raise ValueError("The job {} finsihed but does not match any started job. Please handle manually.".format(finished))
                 sp_run([
                     "cp", "-ru", os.path.join(unpack_dir, finished) + "/.", self.job_folders[j]
-                ])
+                ], capture_output=True)
                 sp_run([
                     "tar -xzf output.tgz && rm output.tgz"
-                ], cwd=self.job_folders[j])
+                ], cwd=self.job_folders[j], capture_output=True)
             os.remove(tarball)
             sp_run([
                 "rm", "-rf", unpack_dir
-            ])
+            ], capture_output=True)
             os.remove(retrieve_script)
         except Exception as e:
             if verbose: print("Failed to retrieve:", e)

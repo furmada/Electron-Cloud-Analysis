@@ -7,6 +7,7 @@ For use with PyECLOUD.
 """
 from typing import Callable, Iterable
 from functools import partial as functools_partial
+from itertools import product
 
 import numpy as np
 import scipy
@@ -166,28 +167,57 @@ class TemplateSim(object):
     def generate_sweep(parameters: Iterable, sweep: Iterable, **constant) -> list[dict]:
         """
         Generate one set of changes for every combination of values for all parameters to be swept.
-        Each parameter should correspond to one entry in sweep.
-        Each entry in sweep should be a list of values that parameter can take.
+        Supports two modes of specification:
+        1. Independent parameters:
+           parameters=['A', 'B']
+           sweep=[[1, 2], ['x', 'y']]
+           Result: A=1,B=x; A=1,B=y; A=2,B=x; A=2,B=y
+        2. Linked (co-varying) parameters:
+           parameters=[('A', 'B')]  # Tuple indicates they vary together
+           sweep=[[(1, 'a'), (2, 'b')]] # Values are tuples matching the parameter tuple order
+           Result: A=1,B=a; A=2,B=b
+        Mixed usage is supported:
+           parameters=['C', ('A', 'B')]
+           sweep=[[10, 20], [(1, 'a'), (2, 'b')]]
+           Result: C=10,A=1,B=a; C=10,A=2,B=b; C=20,A=1,B=a; C=20,A=2,B=b
         """
-        parameters = list(parameters)
-        sweep = list(sweep)
-        lengths = [len(list(s)) for s in sweep]
-        counters = np.zeros(len(parameters), dtype=int)
-
+        param_list = list(parameters)
+        sweep_list = list(sweep)
+        if len(param_list) != len(sweep_list):
+            raise ValueError("The number of parameters must match the number of sweep value lists.")
+        dimensions = []
+        for i, param in enumerate(param_list):
+            values = list(sweep_list[i])
+            if isinstance(param, tuple):
+                # Linked parameters case
+                if not all(isinstance(v, tuple) and len(v) == len(param) for v in values):
+                    raise ValueError(
+                        f"For linked parameters {param}, all values must be tuples of the same length."
+                    )
+                # Create a dimension where each item is a dict mapping param names to values
+                dim = []
+                for val_tuple in values:
+                    dim.append(dict(zip(param, val_tuple)))
+                dimensions.append(dim)
+            else:
+                # Independent parameter case
+                # Create a dimension where each item is a dict with one key
+                dim = [{param: v} for v in values]
+                dimensions.append(dim)
+        # Calculate total combinations
+        total_combinations = np.prod([len(d) for d in dimensions])
         configurations = []
-        for _ in range(np.prod(np.array(lengths))):
-            configurations.append({**constant, **{
-                parameters[c]: sweep[c][counters[c]] for c in range(counters.size)
-            }})
-            
-            j = len(counters) - 1
-            counters[j] += 1
-            while counters[j] >= lengths[j]:
-                counters[j] = 0
-                j -= 1
-                counters[j] += 1
-        return configurations
-                
+        # Use itertools.product to generate the Cartesian product of the dimensions
+        # Each item in 'combo' is a tuple of dicts, e.g. ({'C': 10}, {'A': 1, 'B': 'a'})
+        for combo in product(*dimensions):
+            # Merge all dicts in the tuple into a single config dict
+            merged_config = {}
+            for d in combo:
+                merged_config.update(d)
+            # Add constant parameters
+            final_config = {**constant, **merged_config}
+            configurations.append(final_config)
+        return configurations                
 
 class SimDB(object):
     """

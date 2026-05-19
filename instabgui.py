@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
 """
-ECA GUI - Electron Cloud Analysis Graphical Interface
-A GUI application for browsing, filtering, fitting, and plotting PyECLOUD simulation data.
+INSTAB GUI - Instability Analysis Graphical Interface
+A GUI application for browsing, filtering, and visualizing PyECLOUD/PyHEADTAIL instability simulation data.
+Mirrors the architecture and functionality of ecagui.py for instability-specific analysis.
 """
 
 import sys
@@ -12,23 +12,28 @@ import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from typing import Optional, List, Dict, Any, Callable
 import numpy as np
-from collections import defaultdict
 
 try:
-    from eca import SimDB, ECModel, InstabilityModel, FurmanNoPhotoFit, FurmanPhotoFit, FurmanNPMCFit, Fit, WhereIn, BeforeBunchSelector, BunchAverageSelector
-    from ecaplots import model_plot, versus_plot, histogram_plot
+    from eca import SimDB, InstabilityModel, InstabilityDBFolder, WhereIn
+    from ecaplots import (
+        instability_grid_plot,
+        growth_rate_vs_density_plot,
+        blowup_time_vs_strength_plot,
+        intrabunch_mode_heatmap,
+        instability_mode_evolution_plot
+    )
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
 except ImportError as e:
-    print(f"Error importing ECA modules: {e}")
+    print(f"Error importing Instability modules: {e}")
     print("Make sure eca.py and ecaplots.py are in the same directory or PYTHONPATH")
     sys.exit(1)
 
 
 class FilterDefinition:
-    """Serializable filter definition for copy-paste support."""
-    
+    """Serializable filter definition for copy-paste support (reused from ecagui)."""
+
     @staticmethod
     def to_dict(filter_obj: Dict[str, Any]) -> Dict[str, Any]:
         """Convert filter object to serializable dictionary."""
@@ -48,7 +53,7 @@ class FilterDefinition:
             result["expr"] = filter_obj["expr"]
         
         return result
-    
+
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> Dict[str, Any]:
         """Reconstruct filter object from serialized dictionary."""
@@ -70,12 +75,12 @@ class FilterDefinition:
                 "type": "expression",
                 "expr": data["expr"]
             }
-    
+
     @staticmethod
     def serialize_all(filters: List[Dict[str, Any]]) -> str:
         """Serialize all filters to JSON string."""
         return json.dumps([FilterDefinition.to_dict(f) for f in filters], indent=2)
-    
+
     @staticmethod
     def deserialize_all(json_str: str) -> List[Dict[str, Any]]:
         """Deserialize filters from JSON string."""
@@ -88,33 +93,36 @@ class FilterDefinition:
             raise ValueError(f"Invalid JSON format: {e}")
 
 
-class ECAApp:
-    """Main application class for the Electron Cloud Analysis GUI."""
-    
-    FIT_MODELS = {"FurmanNoPhoto": FurmanNoPhotoFit, "FurmanNPMC": FurmanNPMCFit, "FurmanPhoto": FurmanPhotoFit}
-    
-    def __init__(self, root: tk.Tk, db: Optional[SimDB] = None, is_temp: bool = False, db_file: Optional[str] = None):
+class InstabApp:
+    """Main application class for Instability Analysis GUI."""
+
+    # Common instability-related keys for quick filtering
+    INSTAB_KEYS = [
+        "growth_rate_centroid", "growth_rate_mode", "dominant_mode_idx",
+        "tune_centroid", "blowup_turn_first", "max_emittance_ratio",
+        "instability_threshold", "n_turns", "n_slices", "element",
+        "init_unif_edens_dip", "strength_factor"
+    ]
+
+    def __init__(self, root: tk.Tk, db: Optional[SimDB] = None, is_temp: bool = False):
         self.root = root
         self.is_temp = is_temp
         self.db: Optional[SimDB] = db
         self.search_criteria: Dict[str, Any] = {}
-        self.current_models: List[ECModel] = []
+        self.current_models: List[InstabilityModel] = []
+        self.active_filters_list: List[Dict[str, Any]] = []
         self.filter_val_map = {}
         self.individual_columns = ["doc_id"]
-        
+
         self._setup_window()
         self._setup_fonts()
         self._setup_ui()
-        
-        if db_file:
-            self._load_database_from_file(db_file)
-        elif db:
-            self._load_db_if_available()
+        self._load_db_if_available()
 
     def _setup_window(self):
         """Initialize window properties."""
         title_prefix = "[TEMP WINDOW] " if self.is_temp else ""
-        self.root.title(f"{title_prefix}ECA GUI - Electron Cloud Analysis")
+        self.root.title(f"{title_prefix}Instab GUI - Instability Analysis")
         self.root.geometry("1400x900")
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
@@ -165,7 +173,7 @@ class ECAApp:
                 return str(val)
             
             abs_val = abs(val)
-            if abs_val >= 1000 or abs_val < 1e-4:
+            if abs_val >= 1000 or (abs_val < 1e-4 and abs_val > 0):
                 return f"{val:.3E}"
             elif isinstance(val, (float, np.floating)):
                 return f"{val:.4f}"
@@ -193,8 +201,13 @@ class ECAApp:
         
         self._create_overview_tab()
         self._create_filter_tab()
-        self._create_fitting_tab()
-        self._create_plotting_tab()
+        self._create_analysis_tab()
+        self._create_grid_tab()
+        self._create_growth_rate_tab()
+        self._create_blowup_tab()
+        self._create_mode_evolution_tab()
+        self._create_heatmap_tab()
+        self._create_versus_plot_tab()
         self._create_histogram_tab()
         self._create_individual_plot_tab()
         
@@ -222,17 +235,13 @@ class ECAApp:
     def _load_database(self):
         """Open file dialog and load a database."""
         filename = filedialog.askopenfilename(
-            title="Select Database File",
+            title="Select Instability Database File",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
         )
         
         if not filename:
             return
         
-        self._load_database_from_file(filename)
-
-    def _load_database_from_file(self, filename: str):
-        """Load a database from the specified file path."""
         try:
             self._update_status(f"Loading database from {filename}...")
             self.root.update()
@@ -257,6 +266,8 @@ class ECAApp:
     def _reset_app_state(self):
         """Reset all application state variables."""
         self.search_criteria = {}
+        self.active_filters_list = []
+        self.current_models = []
         self.individual_columns = ["doc_id"]
 
     def _refresh_all_tabs(self):
@@ -312,14 +323,17 @@ class ECAApp:
         
         self.active_filters_text.delete(1.0, tk.END)
         self.results_text.delete(1.0, tk.END)
+        self.individual_sim_tree.delete(*self.individual_sim_tree.get_children())
         self.progress_var.set("Ready")
         
-        self.plot_fig.clear()
-        self.plot_canvas.draw()
-        self.hist_fig.clear()
-        self.hist_canvas.draw()
-        self.individual_fig.clear()
-        self.individual_canvas.draw()
+        # Clear all plot canvases
+        for fig_attr in ['grid_fig', 'growth_fig', 'blowup_fig', 'mode_fig', 'heatmap_fig', 
+                        'versus_fig', 'hist_fig', 'individual_fig']:
+            if hasattr(self, fig_attr):
+                getattr(self, fig_attr).clear()
+                canvas_attr = fig_attr.replace('_fig', '_canvas')
+                if hasattr(self, canvas_attr):
+                    getattr(self, canvas_attr).draw()
 
     # ==================== OVERVIEW TAB ====================
 
@@ -448,7 +462,7 @@ class ECAApp:
         ttk.Label(self.expression_frame, text="Expression:").pack(side=tk.LEFT)
         self.expr_var = tk.StringVar()
         ttk.Entry(self.expression_frame, textvariable=self.expr_var, width=50).pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.expression_frame, text="(e.g., Ne_0 > 1e10 and buildup == True)").pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.expression_frame, text="(e.g., growth_rate_centroid > 0.01 and n_turns > 5000)").pack(side=tk.LEFT, padx=5)
         
         ttk.Button(control_frame, text="Add Filter", command=self._add_filter).pack(pady=5)
         
@@ -511,26 +525,23 @@ class ECAApp:
             self.filter_values_listbox.insert(tk.END, val_str)
 
     def _add_filter(self):
-        """Add a filter criterion to the JSON text based on current mode."""
+        """Add a filter criterion based on current mode."""
         mode = self.filter_mode_var.get()
         
         try:
-            new_filter = None
-            
             if mode == "exact":
-                new_filter = self._create_exact_filter()
+                self._add_exact_filter()
             elif mode == "condition":
-                new_filter = self._create_condition_filter()
+                self._add_condition_filter()
             else:  # expression
-                new_filter = self._create_expression_filter()
+                self._add_expression_filter()
             
-            if new_filter:
-                self._add_filter_to_json(new_filter)
+            self._update_active_filters_display()
         except ValueError as e:
             messagebox.showwarning("Warning", str(e))
 
-    def _create_exact_filter(self) -> Optional[Dict[str, Any]]:
-        """Create exact match filter object."""
+    def _add_exact_filter(self):
+        """Add exact match filter."""
         prop = self.filter_property_var.get()
         if not prop:
             raise ValueError("Please select a property to filter on")
@@ -542,10 +553,15 @@ class ECAApp:
         selected_strings = [self.filter_values_listbox.get(i) for i in selected_indices]
         exact_values = [self.filter_val_map[val_str] for val_str in selected_strings]
         
-        return {"type": "exact", "property": prop, "values": exact_values}
+        for f in self.active_filters_list:
+            if f["type"] == "exact" and f["property"] == prop:
+                f["values"] = list(set(f["values"] + exact_values))
+                return
+        
+        self.active_filters_list.append({"type": "exact", "property": prop, "values": exact_values})
 
-    def _create_condition_filter(self) -> Optional[Dict[str, Any]]:
-        """Create condition filter object."""
+    def _add_condition_filter(self):
+        """Add condition filter."""
         prop = self.filter_property_var.get()
         if not prop:
             raise ValueError("Please select a property for the condition")
@@ -562,33 +578,25 @@ class ECAApp:
             val = val_str
         
         op = self.cond_op_var.get()
-        return {"type": "condition", "property": prop, "operator": op, "value": val}
+        self.active_filters_list.append({"type": "condition", "property": prop, "operator": op, "value": val})
 
-    def _create_expression_filter(self) -> Optional[Dict[str, Any]]:
-        """Create expression filter object."""
+    def _add_expression_filter(self):
+        """Add expression filter."""
         expr = self.expr_var.get().strip()
         if not expr:
             raise ValueError("Please enter an expression")
         
-        return {"type": "expression", "expr": expr}
+        self.active_filters_list.append({"type": "expression", "expr": expr})
 
-    def _add_filter_to_json(self, new_filter: Dict[str, Any]):
-        """Add a new filter to the JSON text in the textbox."""
-        current_text = self.active_filters_text.get(1.0, tk.END).strip()
+    def _update_active_filters_display(self):
+        """Update the active filters display in JSON format."""
+        self.active_filters_text.delete(1.0, tk.END)
         
-        try:
-            if current_text and current_text != "[]":
-                filters = json.loads(current_text)
-            else:
-                filters = []
-        except json.JSONDecodeError:
-            messagebox.showerror("Error", "Invalid JSON in filters text. Please fix it before adding a new filter.")
+        if not self.active_filters_list:
+            self.active_filters_text.insert(tk.END, "[]")
             return
         
-        filters.append(new_filter)
-        
-        json_str = json.dumps(filters, indent=2)
-        self.active_filters_text.delete(1.0, tk.END)
+        json_str = FilterDefinition.serialize_all(self.active_filters_list)
         self.active_filters_text.insert(tk.END, json_str)
 
     def _show_filter_context_menu(self, event):
@@ -606,7 +614,7 @@ class ECAApp:
 
     def _copy_filters(self):
         """Copy filter definitions to clipboard."""
-        json_str = self.active_filters_text.get(1.0, tk.END).strip()
+        json_str = FilterDefinition.serialize_all(self.active_filters_list)
         self.root.clipboard_clear()
         self.root.clipboard_append(json_str)
         self._update_status("Filters copied to clipboard")
@@ -616,60 +624,22 @@ class ECAApp:
         try:
             clipboard_data = self.root.clipboard_get()
             new_filters = FilterDefinition.deserialize_all(clipboard_data)
-            
-            # Get current filters from JSON text
-            current_text = self.active_filters_text.get(1.0, tk.END).strip()
-            try:
-                if current_text and current_text != "[]":
-                    current_filters = json.loads(current_text)
-                else:
-                    current_filters = []
-            except json.JSONDecodeError:
-                current_filters = []
-            
-            current_filters.extend(new_filters)
-            json_str = json.dumps(current_filters, indent=2)
-            self.active_filters_text.delete(1.0, tk.END)
-            self.active_filters_text.insert(tk.END, json_str)
-            
+            self.active_filters_list.extend(new_filters)
+            self._update_active_filters_display()
             self._update_status(f"Pasted {len(new_filters)} filter(s)")
         except ValueError as e:
             messagebox.showerror("Error", f"Failed to paste filters: {str(e)}")
 
-    def _get_filters_from_json(self) -> List[Dict[str, Any]]:
-        """Extract filters from the JSON text in the textbox."""
-        json_str = self.active_filters_text.get(1.0, tk.END).strip()
-        
-        if not json_str or json_str == "[]":
-            return []
-        
-        try:
-            filters = json.loads(json_str)
-            if not isinstance(filters, list):
-                raise ValueError("Filter data must be a JSON array")
-            return filters
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON format in filters: {e}")
-
     def _build_search_criteria(self):
-        """Build query dictionary from filters in JSON text."""
+        """Build query dictionary from active filters."""
         self.search_criteria = {}
-        
-        try:
-            filters = self._get_filters_from_json()
-        except ValueError as e:
-            messagebox.showerror("Error", f"Failed to parse filters: {str(e)}")
-            return False
-        
-        for i, f_data in enumerate(filters):
+        for i, f_data in enumerate(self.active_filters_list):
             if f_data["type"] == "exact":
                 self.search_criteria[f_data["property"]] = WhereIn(*f_data["values"])
             elif f_data["type"] == "condition":
                 self.search_criteria[f"_cond_{i}"] = self._make_condition(f_data["property"], f_data["operator"], f_data["value"])
             else:  # expression
                 self.search_criteria[f"_expr_{i}"] = f_data["expr"]
-        
-        return True
 
     @staticmethod
     def _make_condition(prop: str, op: str, val: Any) -> Callable:
@@ -697,22 +667,19 @@ class ECAApp:
         return cond_fn
 
     def _apply_filter(self):
-        """Apply the filters from JSON text."""
+        """Apply the global search criteria."""
         if not self.db:
             messagebox.showwarning("Warning", "No database loaded")
             return
         
-        filters = self._get_filters_from_json()
-        if not filters:
+        if not self.active_filters_list:
             messagebox.showwarning("Warning", "No filters defined")
             return
         
         try:
-            if not self._build_search_criteria():
-                return
-            
+            self._build_search_criteria()
             filtered_sims = self.db.where(**self.search_criteria)
-            self.current_models = [ECModel(self.db.db, doc) for doc in filtered_sims]
+            self.current_models = [InstabilityModel(self.db.db, doc) for doc in filtered_sims]
             
             self._update_overview_tab()
             self._update_individual_sim_list()
@@ -724,8 +691,8 @@ class ECAApp:
 
     def _clear_filters(self):
         """Clear all active filters from UI."""
-        self.active_filters_text.delete(1.0, tk.END)
-        self.active_filters_text.insert(tk.END, "[]")
+        self.active_filters_list.clear()
+        self._update_active_filters_display()
         self._update_status("Filters cleared")
 
     def _reset_filter(self):
@@ -735,7 +702,7 @@ class ECAApp:
         
         self._clear_filters()
         self.search_criteria = {}
-        self.current_models = [ECModel(self.db.db, doc) for doc in self.db.db.all()]
+        self.current_models = [InstabilityModel(self.db.db, doc) for doc in self.db.db.all()]
         self._update_overview_tab()
         self._update_individual_sim_list()
         self._update_status("Database reset to full dataset.")
@@ -748,7 +715,7 @@ class ECAApp:
             return
         
         new_window = tk.Toplevel(self.root)
-        new_app = ECAApp(new_window, db=self.db, is_temp=True)
+        new_app = InstabApp(new_window, db=self.db, is_temp=True)
         new_app.current_models = self.current_models.copy()
         new_app._update_overview_tab()
         new_app._update_individual_sim_list()
@@ -770,144 +737,454 @@ class ECAApp:
         
         self.filter_property_combo['values'] = valid_properties
 
-    # ==================== FITTING TAB ====================
+    # ==================== ANALYSIS TAB ====================
 
-    def _create_fitting_tab(self):
-        """Create the Fitting tab."""
+    def _create_analysis_tab(self):
+        """Create the Analysis tab for running InstabilityModel.analyze() on filtered data."""
         tab = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(tab, text="Fitting")
-        
-        model_frame = ttk.LabelFrame(tab, text="Fit Model", padding="5")
-        model_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        tab.columnconfigure(0, weight=1)
-        
-        ttk.Label(model_frame, text="Select Fit Model:").pack(side=tk.LEFT)
-        self.fit_model_var = tk.StringVar(value="FurmanNoPhoto")
-        ttk.Combobox(model_frame, textvariable=self.fit_model_var, state="readonly", width=30,
-                     values=list(self.FIT_MODELS.keys())).pack(side=tk.LEFT, padx=5)
-
-        selector_frame = ttk.LabelFrame(tab, text="Data Selection", padding="5")
-        selector_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        
-        ttk.Label(selector_frame, text="Selector:").pack(side=tk.LEFT)
-        self.fit_selector_var = tk.StringVar(value="BunchAverage")
-        ttk.Combobox(selector_frame, textvariable=self.fit_selector_var, state="readonly", width=15,
-                     values=["BunchAverage", "BeforeBunch"]).pack(side=tk.LEFT, padx=5)
-                     
-        self.fit_central_density_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(selector_frame, text="Use Central Density", variable=self.fit_central_density_var).pack(side=tk.LEFT, padx=10)
-        
-        ttk.Label(selector_frame, text="Train:").pack(side=tk.LEFT)
-        self.fit_train_var = tk.StringVar(value="-1")
-        ttk.Entry(selector_frame, textvariable=self.fit_train_var, width=5).pack(side=tk.LEFT, padx=2)
+        self.notebook.add(tab, text="Analysis")
         
         selection_frame = ttk.LabelFrame(tab, text="Selection", padding="5")
-        selection_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
-        tab.rowconfigure(2, weight=0)
+        selection_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        tab.columnconfigure(0, weight=1)
         
-        self.selection_mode = tk.StringVar(value="filtered")
-        ttk.Radiobutton(selection_frame, text="Use Filtered Simulations", 
-                       variable=self.selection_mode, value="filtered").pack(anchor=tk.W)
-        ttk.Radiobutton(selection_frame, text="Use All Simulations", 
-                       variable=self.selection_mode, value="all").pack(anchor=tk.W)
+        self.analysis_mode = tk.StringVar(value="filtered")
+        ttk.Radiobutton(selection_frame, text="Analyze Filtered Simulations", 
+                       variable=self.analysis_mode, value="filtered").pack(anchor=tk.W)
+        ttk.Radiobutton(selection_frame, text="Analyze All Simulations", 
+                       variable=self.analysis_mode, value="all").pack(anchor=tk.W)
         
         progress_frame = ttk.LabelFrame(tab, text="Progress", padding="5")
-        progress_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        progress_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         self.progress_var = tk.StringVar(value="Ready")
         ttk.Label(progress_frame, textvariable=self.progress_var).pack(fill=tk.X)
         
         button_frame = ttk.Frame(tab)
-        button_frame.grid(row=4, column=0, pady=10)
-        ttk.Button(button_frame, text="Apply Fit", command=self._apply_fit).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Refit All", command=self._refit_all).pack(side=tk.LEFT, padx=5)
+        button_frame.grid(row=2, column=0, pady=10)
+        ttk.Button(button_frame, text="Analyze Selected", command=self._run_analysis).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Analyze All", command=self._run_analysis_all).pack(side=tk.LEFT, padx=5)
         
-        results_frame = ttk.LabelFrame(tab, text="Fitting Results", padding="5")
-        results_frame.grid(row=5, column=0, sticky="nsew")
-        tab.rowconfigure(5, weight=1)
+        results_frame = ttk.LabelFrame(tab, text="Analysis Results", padding="5")
+        results_frame.grid(row=3, column=0, sticky="nsew")
+        tab.rowconfigure(3, weight=1)
         
         self.results_text = scrolledtext.ScrolledText(results_frame, height=15, wrap=tk.WORD)
         self.results_text.pack(fill=tk.BOTH, expand=True)
 
-    def _get_models_to_fit(self) -> List[ECModel]:
-        """Get models to fit based on selection mode."""
+    def _get_models_to_analyze(self) -> List[InstabilityModel]:
+        """Get models to analyze based on selection mode."""
         if not self.db:
             return []
         
-        if self.selection_mode.get() == "filtered" and self.search_criteria:
-            return [ECModel(self.db.db, doc) for doc in self.db.where(**self.search_criteria)]
+        if self.analysis_mode.get() == "filtered" and self.search_criteria:
+            return self.db.where(**self.search_criteria)
         else:
-            return [ECModel(self.db.db, doc) for doc in self.db.where()]
+            return self.db.db.all()
 
-    def _apply_fit(self, refit: bool = False):
-        """Apply the selected fit model to simulations."""
+    def _run_analysis(self):
+        """Run analysis on selected simulations."""
         if not self.db:
             messagebox.showwarning("Warning", "No database loaded")
             return
         
-        model_name = self.fit_model_var.get()
-        models = self._get_models_to_fit()
+        models = self._get_models_to_analyze()
         
         if not models:
-            messagebox.showwarning("Warning", "No simulations to fit")
+            messagebox.showwarning("Warning", "No simulations to analyze")
             return
-            
-        selector_type = self.fit_selector_var.get()
-        use_cd = self.fit_central_density_var.get()
-        try:
-            use_train = int(self.fit_train_var.get())
-        except ValueError:
-            messagebox.showwarning("Warning", "Train must be an integer.")
-            return
+        
+        if messagebox.askyesno("Confirm", f"Run analysis on {len(models)} simulation(s)? This may take a while."):
+            self._execute_analysis(models)
 
-        SelectorClass = BeforeBunchSelector if selector_type == "BeforeBunch" else BunchAverageSelector
-        selector = SelectorClass(use_central_density=use_cd, use_train=use_train)
-        
-        fit_class = self.FIT_MODELS.get(model_name)
-        if not fit_class:
-            raise ValueError(f"Unknown fit model: {model_name}")
-        
-        fit = fit_class(self.db, selector=selector) if model_name == "FurmanNPMC" else fit_class(selector=selector)
-        
-        self.progress_var.set("Starting fit...")
-        self.root.update()
-        
-        success_count = sum(1 for i, model in enumerate(models)
-                            if self._execute_fit(fit, model, refit, i, len(models)))
-        
-        self._display_fit_results(success_count, len(models))
-
-    def _execute_fit(self, fit, model: ECModel, refit: bool, current: int, total: int) -> bool:
-        """Execute a single fit and update progress."""
-        try:
-            result = fit.fit(model, refit=refit)
-        except:
-            result = None
-        self.progress_var.set(f"Fitting: {current+1}/{total}")
-        self.root.update()
-        return result is not None
-
-    def _display_fit_results(self, success_count: int, total: int):
-        """Display fitting results."""
-        self.results_text.delete(1.0, tk.END)
-        self.results_text.insert(tk.END, f"Fitting Complete\n{'=' * 50}\n")
-        self.results_text.insert(tk.END, f"Total: {total}\nSuccessful: {success_count}\nFailed: {total - success_count}\n")
-        self._update_status(f"Fitting complete: {success_count}/{total} successful")
-
-    def _refit_all(self):
-        """Refit all simulations with the selected model."""
+    def _run_analysis_all(self):
+        """Run analysis on all simulations in the database."""
         if not self.db:
             messagebox.showwarning("Warning", "No database loaded")
             return
         
-        if messagebox.askyesno("Confirm", "This will refit all selected simulations. Continue?"):
-            self._apply_fit(refit=True)
+        models = self.db.db.all()
+        
+        if not models:
+            messagebox.showwarning("Warning", "No simulations in database")
+            return
+        
+        if messagebox.askyesno("Confirm", f"Run analysis on ALL {len(models)} simulations? This may take a long time."):
+            self._execute_analysis(models)
 
-    # ==================== PLOTTING TAB ====================
+    def _execute_analysis(self, models: List):
+        """Execute analysis on a list of models."""
+        self.results_text.delete(1.0, tk.END)
+        self.progress_var.set("Starting analysis...")
+        self.root.update()
+        
+        success_count = 0
+        failed_count = 0
+        
+        for i, model in enumerate(models):
+            try:
+                model = InstabilityModel(self.db, model)
+                self.progress_var.set(f"Analyzing: {i+1}/{len(models)} - Doc ID: {model.doc_id}")
+                self.root.update()
+                
+                # Run the analyze() method which generates all properties
+                model.run_analysis()
+                success_count += 1
+                
+            except Exception as e:
+                failed_count += 1
+                self.results_text.insert(tk.END, f"Error analyzing Doc ID {model.doc_id}: {str(e)}\n")
+        
+        # Reload the database to pick up new properties
+        if success_count > 0:
+            try:
+                self._update_status("Reloading database with new properties...")
+                self.root.update()
+                # Refresh all tabs to show new data
+                self._refresh_all_tabs()
+            except Exception as e:
+                self.results_text.insert(tk.END, f"\nError reloading database: {str(e)}\n")
+        
+        self._display_analysis_results(success_count, len(models))
 
-    def _create_plotting_tab(self):
-        """Create the Plotting tab for database-wide plots."""
+    def _display_analysis_results(self, success_count: int, total: int):
+        """Display analysis results."""
+        result_summary = f"Analysis Complete\n{'=' * 50}\n"
+        result_summary += f"Total: {total}\nSuccessful: {success_count}\nFailed: {total - success_count}\n"
+        
+        self.results_text.insert(1.0, result_summary)
+        self.progress_var.set(f"Analysis complete: {success_count}/{total} successful")
+        self._update_status(f"Analysis complete: {success_count}/{total} successful")
+
+    # ==================== GRID TAB ====================
+
+    def _create_grid_tab(self):
+        """Create the Grid visualization tab."""
         tab = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(tab, text="Database Plots")
+        self.notebook.add(tab, text="Instability Grid")
+
+        control_frame = ttk.LabelFrame(tab, text="Grid Configuration", padding="5")
+        control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        tab.columnconfigure(0, weight=1)
+
+        ttk.Label(control_frame, text="Max Simulations:").pack(side=tk.LEFT, padx=(0, 10))
+        self.grid_max_var = tk.StringVar(value="5")
+        ttk.Entry(control_frame, textvariable=self.grid_max_var, width=5).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(control_frame, text="Colormap:").pack(side=tk.LEFT, padx=(10, 0))
+        self.grid_cmap_var = tk.StringVar(value="viridis")
+        cmap_options = ["viridis", "plasma", "inferno", "magma", "cividis", "coolwarm"]
+        ttk.Combobox(control_frame, textvariable=self.grid_cmap_var, state="readonly", values=cmap_options, width=15).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(control_frame, text="Generate Grid Plot", command=self._generate_grid_plot).pack(side=tk.LEFT, padx=20)
+
+        plot_frame = ttk.LabelFrame(tab, text="Evolution Grid", padding="5")
+        plot_frame.grid(row=1, column=0, sticky="nsew")
+        tab.rowconfigure(1, weight=1)
+
+        self.grid_fig = Figure(figsize=(14, 16), dpi=100)
+        self.grid_canvas = FigureCanvasTkAgg(self.grid_fig, master=plot_frame)
+        self.grid_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.grid_canvas, plot_frame).update()
+
+    def _generate_grid_plot(self):
+        """Generate and display the grid plot."""
+        if not self.db:
+            messagebox.showwarning("Warning", "No database loaded")
+            return
+
+        try:
+            max_plots = int(self.grid_max_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Max Simulations must be an integer.")
+            return
+
+        cmap_name = self.grid_cmap_var.get()
+        try:
+            colormap = plt.get_cmap(cmap_name)
+        except:
+            colormap = plt.cm.viridis
+
+        self.grid_fig.clear()
+
+        try:
+            self._update_status("Generating grid plot...")
+            self.root.update()
+            
+            db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
+            instability_grid_plot(
+                db=db_to_use,
+                size=(14, 16),
+                max_plots=max_plots,
+                colormap=colormap
+            )
+            self.grid_canvas.draw()
+            self._update_status("Grid plot generated")
+        except Exception as e:
+            messagebox.showerror("Error", f"Grid plot generation failed: {str(e)}")
+            self._update_status("Error generating grid plot")
+
+    # ==================== GROWTH RATE TAB ====================
+
+    def _create_growth_rate_tab(self):
+        """Create the Growth Rate vs Density tab."""
+        tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(tab, text="Growth Rate vs Density")
+
+        control_frame = ttk.LabelFrame(tab, text="Plot Configuration", padding="5")
+        control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        tab.columnconfigure(0, weight=1)
+
+        ttk.Label(control_frame, text="Density Key:").pack(side=tk.LEFT, padx=(0, 10))
+        self.growth_density_var = tk.StringVar(value="init_unif_edens_dip")
+        self.growth_density_combo = ttk.Combobox(control_frame, textvariable=self.growth_density_var, state="readonly", width=20)
+        self.growth_density_combo.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(control_frame, text="Growth Key:").pack(side=tk.LEFT, padx=(10, 0))
+        self.growth_rate_var = tk.StringVar(value="growth_rate_mode")
+        self.growth_rate_combo = ttk.Combobox(control_frame, textvariable=self.growth_rate_var, state="readonly", width=20)
+        self.growth_rate_combo.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(control_frame, text="Generate Plot", command=self._generate_growth_plot).pack(side=tk.LEFT, padx=20)
+
+        plot_frame = ttk.LabelFrame(tab, text="Growth Rate Plot", padding="5")
+        plot_frame.grid(row=1, column=0, sticky="nsew")
+        tab.rowconfigure(1, weight=1)
+
+        self.growth_fig = Figure(figsize=(8, 6), dpi=100)
+        self.growth_canvas = FigureCanvasTkAgg(self.growth_fig, master=plot_frame)
+        self.growth_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.growth_canvas, plot_frame).update()
+
+    def _generate_growth_plot(self):
+        """Generate and display the growth rate plot."""
+        if not self.db:
+            messagebox.showwarning("Warning", "No database loaded")
+            return
+
+        density_key = self.growth_density_var.get()
+        growth_key = self.growth_rate_var.get()
+
+        if not (density_key and growth_key):
+            messagebox.showwarning("Warning", "Please select both density and growth keys")
+            return
+
+        self.growth_fig.clear()
+        try:
+            self._update_status("Generating growth rate plot...")
+            self.root.update()
+            
+            db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
+            growth_rate_vs_density_plot(
+                db=db_to_use,
+                density_key=density_key,
+                growth_key=growth_key,
+                size=(8, 6))
+            self.growth_canvas.draw()
+            self._update_status("Growth rate plot generated")
+        except Exception as e:
+            messagebox.showerror("Error", f"Growth rate plot generation failed: {str(e)}")
+            self._update_status("Error generating growth rate plot")
+
+    # ==================== BLOWUP TAB ====================
+
+    def _create_blowup_tab(self):
+        """Create the Blow-up Time vs Strength tab."""
+        tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(tab, text="Blow-up Time vs Strength")
+
+        control_frame = ttk.LabelFrame(tab, text="Plot Configuration", padding="5")
+        control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        tab.columnconfigure(0, weight=1)
+
+        ttk.Label(control_frame, text="Strength Key:").pack(side=tk.LEFT, padx=(0, 10))
+        self.blowup_strength_var = tk.StringVar(value="strength_factor")
+        self.blowup_strength_combo = ttk.Combobox(control_frame, textvariable=self.blowup_strength_var, state="readonly", width=20)
+        self.blowup_strength_combo.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(control_frame, text="Turns Key:").pack(side=tk.LEFT, padx=(10, 0))
+        self.blowup_turns_var = tk.StringVar(value="blowup_turn_first")
+        self.blowup_turns_combo = ttk.Combobox(control_frame, textvariable=self.blowup_turns_var, state="readonly", width=20)
+        self.blowup_turns_combo.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(control_frame, text="Generate Plot", command=self._generate_blowup_plot).pack(side=tk.LEFT, padx=20)
+
+        plot_frame = ttk.LabelFrame(tab, text="Blow-up Plot", padding="5")
+        plot_frame.grid(row=1, column=0, sticky="nsew")
+        tab.rowconfigure(1, weight=1)
+
+        self.blowup_fig = Figure(figsize=(8, 6), dpi=100)
+        self.blowup_canvas = FigureCanvasTkAgg(self.blowup_fig, master=plot_frame)
+        self.blowup_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.blowup_canvas, plot_frame).update()
+
+    def _generate_blowup_plot(self):
+        """Generate and display the blow-up plot."""
+        if not self.db:
+            messagebox.showwarning("Warning", "No database loaded")
+            return
+
+        strength_key = self.blowup_strength_var.get()
+        turns_key = self.blowup_turns_var.get()
+
+        if not (strength_key and turns_key):
+            messagebox.showwarning("Warning", "Please select both strength and turns keys")
+            return
+
+        self.blowup_fig.clear()
+        try:
+            self._update_status("Generating blow-up plot...")
+            self.root.update()
+            
+            db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
+            blowup_time_vs_strength_plot(
+                db=db_to_use,
+                strength_key=strength_key,
+                turns_key=turns_key,
+                size=(8, 6))
+            self.blowup_canvas.draw()
+            self._update_status("Blow-up plot generated")
+        except Exception as e:
+            messagebox.showerror("Error", f"Blow-up plot generation failed: {str(e)}")
+            self._update_status("Error generating blow-up plot")
+
+    # ==================== MODE EVOLUTION TAB ====================
+
+    def _create_mode_evolution_tab(self):
+        """Create the Mode Evolution tab."""
+        tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(tab, text="Mode Evolution")
+
+        control_frame = ttk.LabelFrame(tab, text="Simulation Selection", padding="5")
+        control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        tab.columnconfigure(0, weight=1)
+
+        ttk.Label(control_frame, text="Model Index:").pack(side=tk.LEFT, padx=(0, 10))
+        self.mode_idx_var = tk.StringVar(value="0")
+        ttk.Entry(control_frame, textvariable=self.mode_idx_var, width=5).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(control_frame, text="Colormap:").pack(side=tk.LEFT, padx=(10, 0))
+        self.mode_cmap_var = tk.StringVar(value="viridis")
+        cmap_options = ["viridis", "plasma", "inferno", "magma", "cividis", "RdBu_r"]
+        ttk.Combobox(control_frame, textvariable=self.mode_cmap_var, state="readonly", values=cmap_options, width=15).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(control_frame, text="Generate Spectrogram", command=self._generate_mode_plot).pack(side=tk.LEFT, padx=20)
+
+        plot_frame = ttk.LabelFrame(tab, text="Mode Evolution Spectrogram", padding="5")
+        plot_frame.grid(row=1, column=0, sticky="nsew")
+        tab.rowconfigure(1, weight=1)
+
+        self.mode_fig = Figure(figsize=(12, 8), dpi=100)
+        self.mode_canvas = FigureCanvasTkAgg(self.mode_fig, master=plot_frame)
+        self.mode_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.mode_canvas, plot_frame).update()
+
+    def _generate_mode_plot(self):
+        """Generate and display the mode evolution plot."""
+        if not self.db:
+            messagebox.showwarning("Warning", "No database loaded")
+            return
+
+        try:
+            model_idx = int(self.mode_idx_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Model Index must be an integer.")
+            return
+
+        cmap_name = self.mode_cmap_var.get()
+        try:
+            colormap = plt.get_cmap(cmap_name)
+        except:
+            colormap = plt.cm.viridis
+
+        self.mode_fig.clear()
+        try:
+            self._update_status("Generating mode evolution plot...")
+            self.root.update()
+            
+            db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
+            instability_mode_evolution_plot(
+                db=db_to_use,
+                model_idx=model_idx,
+                size=(12, 8),
+                colormap=colormap)
+            self.mode_canvas.draw()
+            self._update_status("Mode evolution plot generated")
+        except Exception as e:
+            messagebox.showerror("Error", f"Mode evolution plot generation failed: {str(e)}")
+            self._update_status("Error generating mode evolution plot")
+
+    # ==================== HEATMAP TAB ====================
+
+    def _create_heatmap_tab(self):
+        """Create the Intra-bunch Heatmap tab."""
+        tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(tab, text="Intra-bunch Heatmap")
+
+        control_frame = ttk.LabelFrame(tab, text="Simulation Selection", padding="5")
+        control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        tab.columnconfigure(0, weight=1)
+
+        ttk.Label(control_frame, text="Model Index:").pack(side=tk.LEFT, padx=(0, 10))
+        self.heatmap_idx_var = tk.StringVar(value="0")
+        ttk.Entry(control_frame, textvariable=self.heatmap_idx_var, width=5).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(control_frame, text="Colormap:").pack(side=tk.LEFT, padx=(10, 0))
+        self.heatmap_cmap_var = tk.StringVar(value="RdBu_r")
+        cmap_options = ["RdBu_r", "viridis", "plasma", "coolwarm", "seismic"]
+        ttk.Combobox(control_frame, textvariable=self.heatmap_cmap_var, state="readonly", values=cmap_options, width=15).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(control_frame, text="Generate Heatmap", command=self._generate_heatmap_plot).pack(side=tk.LEFT, padx=20)
+
+        plot_frame = ttk.LabelFrame(tab, text="Intra-bunch Mode Structure", padding="5")
+        plot_frame.grid(row=1, column=0, sticky="nsew")
+        tab.rowconfigure(1, weight=1)
+
+        self.heatmap_fig = Figure(figsize=(10, 6), dpi=100)
+        self.heatmap_canvas = FigureCanvasTkAgg(self.heatmap_fig, master=plot_frame)
+        self.heatmap_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.heatmap_canvas, plot_frame).update()
+
+    def _generate_heatmap_plot(self):
+        """Generate and display the heatmap plot."""
+        if not self.db:
+            messagebox.showwarning("Warning", "No database loaded")
+            return
+
+        try:
+            model_idx = int(self.heatmap_idx_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Model Index must be an integer.")
+            return
+
+        cmap_name = self.heatmap_cmap_var.get()
+        try:
+            colormap = plt.get_cmap(cmap_name)
+        except:
+            colormap = plt.cm.RdBu_r
+
+        self.heatmap_fig.clear()
+        try:
+            self._update_status("Generating heatmap...")
+            self.root.update()
+            
+            db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
+            intrabunch_mode_heatmap(
+                db=db_to_use,
+                model_idx=model_idx,
+                size=(10, 6),
+                colormap=colormap)
+            self.heatmap_canvas.draw()
+            self._update_status("Heatmap generated")
+        except Exception as e:
+            messagebox.showerror("Error", f"Heatmap generation failed: {str(e)}")
+            self._update_status("Error generating heatmap")
+
+    # ==================== VERSUS PLOT TAB ====================
+
+    def _create_versus_plot_tab(self):
+        """Create the Versus Plot tab for database-wide plots."""
+        tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(tab, text="Versus Plot")
         
         control_frame = ttk.LabelFrame(tab, text="Plot Controls", padding="5")
         control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -917,92 +1194,73 @@ class ECAApp:
         axes_frame.pack(fill=tk.X, pady=5)
         
         ttk.Label(axes_frame, text="X-axis:").pack(side=tk.LEFT)
-        self.plot_x_var = tk.StringVar()
-        self.plot_x_combo = ttk.Combobox(axes_frame, textvariable=self.plot_x_var, state="readonly", width=20)
-        self.plot_x_combo.pack(side=tk.LEFT, padx=5)
+        self.versus_x_var = tk.StringVar()
+        self.versus_x_combo = ttk.Combobox(axes_frame, textvariable=self.versus_x_var, state="readonly", width=20)
+        self.versus_x_combo.pack(side=tk.LEFT, padx=5)
         
         ttk.Label(axes_frame, text="Y-axis:").pack(side=tk.LEFT)
-        self.plot_y_var = tk.StringVar()
-        self.plot_y_combo = ttk.Combobox(axes_frame, textvariable=self.plot_y_var, state="readonly", width=20)
-        self.plot_y_combo.pack(side=tk.LEFT, padx=5)
+        self.versus_y_var = tk.StringVar()
+        self.versus_y_combo = ttk.Combobox(axes_frame, textvariable=self.versus_y_var, state="readonly", width=20)
+        self.versus_y_combo.pack(side=tk.LEFT, padx=5)
         
         color_frame = ttk.Frame(control_frame)
         color_frame.pack(fill=tk.X, pady=5)
         ttk.Label(color_frame, text="Color by:").pack(side=tk.LEFT)
-        self.plot_color_var = tk.StringVar(value="None")
-        self.plot_color_combo = ttk.Combobox(color_frame, textvariable=self.plot_color_var, state="readonly", width=20)
-        self.plot_color_combo.pack(side=tk.LEFT, padx=5)
+        self.versus_color_var = tk.StringVar(value="None")
+        self.versus_color_combo = ttk.Combobox(color_frame, textvariable=self.versus_color_var, state="readonly", width=20)
+        self.versus_color_combo.pack(side=tk.LEFT, padx=5)
         
-        ttk.Button(control_frame, text="Generate Plot", command=self._generate_plot).pack(pady=10)
+        ttk.Button(control_frame, text="Generate Plot", command=self._generate_versus_plot).pack(pady=10)
         
         plot_frame = ttk.LabelFrame(tab, text="Plot", padding="5")
         plot_frame.grid(row=1, column=0, sticky="nsew")
         tab.rowconfigure(1, weight=1)
         
-        self.plot_fig = Figure(figsize=(8, 6), dpi=100)
-        self.plot_canvas = FigureCanvasTkAgg(self.plot_fig, master=plot_frame)
-        self.plot_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.plot_canvas, plot_frame).update()
+        self.versus_fig = Figure(figsize=(8, 6), dpi=100)
+        self.versus_canvas = FigureCanvasTkAgg(self.versus_fig, master=plot_frame)
+        self.versus_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.versus_canvas, plot_frame).update()
 
-    def _populate_plot_options(self):
-        """Populate plot axis dropdowns."""
-        if not self.db:
-            return
-        
-        plotable_props = self._get_plotable_properties()
-        self.plot_x_combo['values'] = plotable_props
-        self.plot_y_combo['values'] = plotable_props
-        self.plot_color_combo['values'] = ["None"] + plotable_props
-        
-        if hasattr(self, 'hist_prop_combo'):
-            self.hist_prop_combo['values'] = plotable_props
-
-    def _get_plotable_properties(self) -> List[str]:
-        """Get list of plotable properties."""
-        if not self.db:
-            return []
-        
-        plotable_props = []
-        for key in self.db.all_keys():
-            if key in ['path', 'processed']:
-                continue
-            
-            try:
-                unique_values = self.db.unique(key)
-                if len(unique_values) <= 1:
-                    continue
-                
-                if any(isinstance(v, (int, float, np.number)) and not (np.isnan(v) or np.isinf(v)) 
-                       for v in unique_values):
-                    plotable_props.append(key)
-            except Exception:
-                continue
-        
-        return plotable_props
-
-    def _generate_plot(self):
-        """Generate a plot using ecaplots.versus_plot."""
+    def _generate_versus_plot(self):
+        """Generate a versus plot from filtered data."""
         if not self.db:
             messagebox.showwarning("Warning", "No database loaded")
             return
         
-        x_prop, y_prop = self.plot_x_var.get(), self.plot_y_var.get()
-        color_prop = self.plot_color_var.get() if self.plot_color_var.get() != "None" else None
+        x_prop, y_prop = self.versus_x_var.get(), self.versus_y_var.get()
         
         if not (x_prop and y_prop):
             messagebox.showwarning("Warning", "Please select both X and Y axes")
             return
         
         try:
-            self.plot_fig.clear()
-            ax = self.plot_fig.add_subplot(111)
+            self.versus_fig.clear()
+            ax = self.versus_fig.add_subplot(111)
             
             db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
-            versus_plot(db_to_use, x_prop, y_prop, colorBy=color_prop, size=ax)
             
-            self.plot_canvas.draw()
-            title_suffix = f" (colored by {color_prop})" if color_prop else ""
-            self._update_status(f"Plot generated: {y_prop} vs {x_prop}{title_suffix}")
+            # Extract data
+            x_data = []
+            y_data = []
+            for doc in db_to_use.db.all():
+                if x_prop in doc and y_prop in doc:
+                    x_val = doc[x_prop]
+                    y_val = doc[y_prop]
+                    if isinstance(x_val, (int, float, np.number)) and isinstance(y_val, (int, float, np.number)):
+                        if np.isfinite(x_val) and np.isfinite(y_val):
+                            x_data.append(x_val)
+                            y_data.append(y_val)
+            
+            if x_data and y_data:
+                ax.scatter(x_data, y_data, alpha=0.6, s=50)
+                ax.set_xlabel(x_prop, fontsize=12)
+                ax.set_ylabel(y_prop, fontsize=12)
+                ax.grid(True, alpha=0.3)
+                self.versus_fig.tight_layout()
+                self.versus_canvas.draw()
+                self._update_status(f"Versus plot generated: {y_prop} vs {x_prop}")
+            else:
+                messagebox.showwarning("Warning", "No valid data points found for the selected properties")
         except Exception as e:
             messagebox.showerror("Error", f"Plot generation failed: {str(e)}")
 
@@ -1011,7 +1269,7 @@ class ECAApp:
     def _create_histogram_tab(self):
         """Create the Histogram tab."""
         tab = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(tab, text="Histogram Plots")
+        self.notebook.add(tab, text="Histogram")
         
         control_frame = ttk.LabelFrame(tab, text="Plot Controls", padding="5")
         control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -1044,7 +1302,7 @@ class ECAApp:
         NavigationToolbar2Tk(self.hist_canvas, plot_frame).update()
 
     def _generate_histogram(self):
-        """Generate a histogram using ecaplots.histogram_plot."""
+        """Generate a histogram from filtered data."""
         if not self.db:
             messagebox.showwarning("Warning", "No database loaded")
             return
@@ -1069,17 +1327,34 @@ class ECAApp:
             ax = self.hist_fig.add_subplot(111)
             
             db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
-            histogram_plot(db_to_use, prop, bins=bins_val, log_y=self.hist_log_var.get(), size=ax)
             
-            self.hist_canvas.draw()
-            self._update_status(f"Histogram generated: {prop}")
+            # Extract data
+            data = []
+            for doc in db_to_use.db.all():
+                if prop in doc:
+                    val = doc[prop]
+                    if isinstance(val, (int, float, np.number)) and np.isfinite(val):
+                        data.append(val)
+            
+            if data:
+                ax.hist(data, bins=bins_val if isinstance(bins_val, int) else 'auto')
+                if self.hist_log_var.get():
+                    ax.set_yscale('log')
+                ax.set_xlabel(prop, fontsize=12)
+                ax.set_ylabel("Count", fontsize=12)
+                ax.grid(True, alpha=0.3, axis='y')
+                self.hist_fig.tight_layout()
+                self.hist_canvas.draw()
+                self._update_status(f"Histogram generated: {prop}")
+            else:
+                messagebox.showwarning("Warning", "No valid data found for the selected property")
         except Exception as e:
             messagebox.showerror("Error", f"Histogram generation failed: {str(e)}")
 
     # ==================== INDIVIDUAL PLOT TAB ====================
 
     def _create_individual_plot_tab(self):
-        """Create the Individual Plot tab."""
+        """Create the Individual Simulation Plot tab."""
         tab = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(tab, text="Individual Plot")
         
@@ -1098,8 +1373,9 @@ class ECAApp:
         ttk.Button(col_frame, text="Reset", command=self._reset_indiv_columns).pack(side=tk.LEFT, padx=2)
         
         self.individual_sim_tree = ttk.Treeview(left_frame, columns=self.individual_columns, show="headings", height=15)
-        self.individual_sim_tree.heading("doc_id", text="Doc ID")
-        self.individual_sim_tree.column("doc_id", width=80)
+        if len(self.individual_columns) > 0:
+            self.individual_sim_tree.heading("doc_id", text="Doc ID")
+            self.individual_sim_tree.column("doc_id", width=80)
         sim_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.individual_sim_tree.yview)
         self.individual_sim_tree.configure(yscrollcommand=sim_scroll.set)
         self.individual_sim_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1112,34 +1388,13 @@ class ECAApp:
         right_frame.columnconfigure(0, weight=1)
         right_frame.rowconfigure(1, weight=1)
         
-        fit_frame = ttk.LabelFrame(right_frame, text="Plot Configuration", padding="5")
-        fit_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        info_frame = ttk.LabelFrame(right_frame, text="Simulation Info", padding="5")
+        info_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         
-        ttk.Label(fit_frame, text="Apply Fits:").pack(side=tk.LEFT)
+        self.individual_info_text = scrolledtext.ScrolledText(info_frame, height=6, wrap=tk.WORD)
+        self.individual_info_text.pack(fill=tk.BOTH, expand=True)
         
-        self.individual_fit_vars = {}
-        for fit_name in self.FIT_MODELS.keys():
-            var = tk.BooleanVar(value=False)
-            self.individual_fit_vars[fit_name] = var
-            # Bind the checkbutton to immediately redraw the plot
-            ttk.Checkbutton(fit_frame, text=fit_name, variable=var, command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=5)
-        
-        self.individual_central_density_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fit_frame, text="Use Central Density", variable=self.individual_central_density_var, command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=10)
-
-        # Replace text entry with Combobox for selecting train
-        ttk.Label(fit_frame, text="View Train:").pack(side=tk.LEFT, padx=(5, 2))
-        self.individual_train_var = tk.StringVar(value="All")
-        self.individual_train_combo = ttk.Combobox(fit_frame, textvariable=self.individual_train_var, state="readonly", width=8)
-        self.individual_train_combo.pack(side=tk.LEFT, padx=2)
-        self.individual_train_combo.bind("<<ComboboxSelected>>", lambda e: self._plot_individual_simulation())
-        
-        ttk.Label(fit_frame, text="Max X:").pack(side=tk.LEFT, padx=(5, 2))
-        self.individual_max_x_var = tk.StringVar()
-        ttk.Entry(fit_frame, textvariable=self.individual_max_x_var, width=8).pack(side=tk.LEFT, padx=2)
-        ttk.Button(fit_frame, text="Replot", command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=10)
-        
-        plot_frame = ttk.LabelFrame(right_frame, text="Simulation Plot", padding="5")
+        plot_frame = ttk.LabelFrame(right_frame, text="Simulation Evolution", padding="5")
         plot_frame.grid(row=1, column=0, sticky="nsew")
         
         self.individual_fig = Figure(figsize=(10, 6), dpi=100)
@@ -1165,7 +1420,7 @@ class ECAApp:
         self._update_individual_sim_list()
 
     def _update_individual_sim_list(self):
-        """Update the individual simulation list."""
+        """Update the individual simulation list from filtered results."""
         for item in self.individual_sim_tree.get_children():
             self.individual_sim_tree.delete(item)
         
@@ -1177,108 +1432,156 @@ class ECAApp:
             self.individual_sim_tree.heading(col, text=col)
             self.individual_sim_tree.column(col, width=120 if col != "doc_id" else 60)
         
-        for sim in self.db.where(**self.search_criteria):
+        # Only show simulations that match current filter
+        simulations = self.db.where(**self.search_criteria) if self.search_criteria else self.db.where()
+        for sim in simulations:
             values = [sim.doc_id if col == "doc_id" else self._format_value(sim.get(col, "N/A")) 
                      for col in self.individual_columns]
             self.individual_sim_tree.insert("", tk.END, values=values)
 
     def _plot_individual_simulation(self, *args):
-        """Plot selected simulation(s)."""
+        """Plot selected simulation evolution data."""
         selections = self.individual_sim_tree.selection()
         if not (selections and self.db):
+            self.individual_info_text.delete(1.0, tk.END)
+            self.individual_fig.clear()
+            self.individual_canvas.draw()
             return
         
+        try:
+            doc_id_idx = self.individual_columns.index("doc_id")
+            doc_id = int(self.individual_sim_tree.item(selections[0])['values'][doc_id_idx])
+        except (ValueError, IndexError):
+            return
+        
+        model = InstabilityModel(self.db.db, doc_id)
+        
+        # Display simulation info
+        self.individual_info_text.delete(1.0, tk.END)
+        info_lines = [
+            f"Doc ID: {model.doc_id}",
+            f"Path: {model.path}",
+            f"N Turns: {model.n_turns}",
+            f"N Slices: {model.n_slices}",
+            f"Growth Rate (Centroid): {self._format_value(model.growth_rate_centroid)}",
+            f"Dominant Mode Index: {model.dominant_mode_idx}",
+            f"Blowup Turn First: {self._format_value(model.blowup_turn_first)}",
+        ]
+        self.individual_info_text.insert(tk.END, "\n".join(info_lines))
+        
+        # Plot evolution data
         self.individual_fig.clear()
-        ax = self.individual_fig.add_subplot(111)
-        
-        # Collect selected fit models
-        selected_fits = [name for name, var in self.individual_fit_vars.items() if var.get()]
-        plotted_count = 0
-        
-        # Determine train view logic and populate dropdown if exactly 1 simulation is selected
-        if len(selections) == 1:
-            try:
-                doc_id_idx = self.individual_columns.index("doc_id")
-                doc_id = int(self.individual_sim_tree.item(selections[0])['values'][doc_id_idx])
-                model = ECModel(self.db.db, doc_id)
-                num_trains = len(model.train_times)
-                train_options = ["All"] + [str(i) for i in range(num_trains)]
+        try:
+            # Create subplots for different observables
+            n_plots = 3
+            for i, (data_attr, label) in enumerate([
+                ('mean_x', 'Centroid X'),
+                ('epsn_x', 'Norm. Emittance X'),
+                ('sigma_x', 'Bunch Length X')
+            ]):
+                ax = self.individual_fig.add_subplot(n_plots, 1, i + 1)
+                data = getattr(model, data_attr, np.array([]))
                 
-                # Check if we should update default selection (due to model or fit toggles)
-                if getattr(self, '_last_doc_id', None) != doc_id or getattr(self, '_last_fits', None) != selected_fits:
-                    self.individual_train_combo['values'] = train_options
-                    if selected_fits:
-                        fit_class = self.FIT_MODELS[selected_fits[0]]
-                        fit_inst = fit_class(self.db) if selected_fits[0] == "FurmanNPMC" else fit_class()
-                        fit_train = fit_inst._mget("train", model, -1)
-                        if fit_train < 0:
-                            fit_train += num_trains
-                        if 0 <= fit_train < num_trains:
-                            self.individual_train_var.set(str(fit_train))
-                    else:
-                        self.individual_train_var.set("All")
-                        
-                    self._last_doc_id = doc_id
-                    self._last_fits = selected_fits.copy()
-            except (ValueError, IndexError, AttributeError):
-                pass
-
-        # Parse selected train
-        train_str = self.individual_train_var.get().strip()
-        plot_train = "All" if not train_str or train_str.lower() == "all" else int(train_str)
-        
-        for selection in selections:
-            try:
-                doc_id_idx = self.individual_columns.index("doc_id")
-                doc_id = int(self.individual_sim_tree.item(selection)['values'][doc_id_idx])
-            except (ValueError, IndexError):
-                continue
+                if len(data) > 0:
+                    turns = np.arange(len(data))
+                    valid = np.isfinite(data)
+                    if np.any(valid):
+                        ax.plot(turns[valid], data[valid], 'b-', linewidth=1.5)
+                        ax.grid(True, alpha=0.3)
+                        ax.set_ylabel(label, fontsize=10)
+                        if i == n_plots - 1:
+                            ax.set_xlabel("Turns", fontsize=10)
+                else:
+                    ax.text(0.5, 0.5, f"No data for {label}", ha='center', va='center', transform=ax.transAxes)
             
-            model = ECModel(self.db.db, doc_id)
-            path_exists = os.path.exists(model.path) and os.path.exists(os.path.join(model.path, "Pyecltest.mat"))
-            
-            fits_to_plot = []
-            for fit_model_name in selected_fits:
-                fit_class = self.FIT_MODELS.get(fit_model_name)
-                if fit_class:
-                    fit_inst = fit_class(self.db) if fit_model_name == "FurmanNPMC" else fit_class()
-                    fits_to_plot.append(fit_inst)
-            
-            if not (path_exists or fits_to_plot):
-                continue
-            
-            cd_param = self.individual_central_density_var.get() if path_exists else None
-            
-            max_x_str = self.individual_max_x_var.get().strip()
-            try:
-                fit_max_x = float(max_x_str) if max_x_str else (model.cutoff / model.bunch_step) * 1.25
-                if len(selections) == 1:
-                    self.individual_max_x_var.set(f"{fit_max_x:.1f}")
-            except (ValueError, AttributeError):
-                fit_max_x = 300.0
-            
-            model_plot(model=model, fits=fits_to_plot, size=ax, show_error=True, 
-                       central_density=cd_param, fit_maxX=fit_max_x, label=str(doc_id),
-                       train=plot_train)
-            plotted_count += 1
-        
-        if plotted_count > 0:
             self.individual_fig.tight_layout()
             self.individual_canvas.draw()
-            self._update_status(f"Plotted {plotted_count} simulation(s)")
+            self._update_status(f"Plotted simulation {doc_id}")
+        except Exception as e:
+            self.individual_info_text.insert(tk.END, f"\n\nError plotting: {str(e)}")
+            self._update_status(f"Error plotting simulation: {str(e)}")
+
+    # ==================== POPULATION HELPERS ====================
+
+    def _populate_plot_options(self):
+        """Populate plot option dropdowns with available properties."""
+        if not self.db:
+            return
+        
+        plotable_props = self._get_plotable_properties()
+        
+        # Update growth rate dropdowns
+        if hasattr(self, 'growth_density_combo'):
+            self.growth_density_combo['values'] = plotable_props
+            if "init_unif_edens_dip" in plotable_props:
+                self.growth_density_var.set("init_unif_edens_dip")
+            elif len(plotable_props) > 0:
+                self.growth_density_var.set(plotable_props[0])
+        
+        if hasattr(self, 'growth_rate_combo'):
+            self.growth_rate_combo['values'] = plotable_props
+            if "growth_rate_mode" in plotable_props:
+                self.growth_rate_var.set("growth_rate_mode")
+            elif "growth_rate_centroid" in plotable_props:
+                self.growth_rate_var.set("growth_rate_centroid")
+            elif len(plotable_props) > 0:
+                self.growth_rate_var.set(plotable_props[0])
+        
+        # Update blowup dropdowns
+        if hasattr(self, 'blowup_strength_combo'):
+            self.blowup_strength_combo['values'] = plotable_props
+            if "strength_factor" in plotable_props:
+                self.blowup_strength_var.set("strength_factor")
+            elif len(plotable_props) > 0:
+                self.blowup_strength_var.set(plotable_props[0])
+        
+        if hasattr(self, 'blowup_turns_combo'):
+            self.blowup_turns_combo['values'] = plotable_props
+            if "blowup_turn_first" in plotable_props:
+                self.blowup_turns_var.set("blowup_turn_first")
+            elif len(plotable_props) > 0:
+                self.blowup_turns_var.set(plotable_props[0])
+        
+        # Update versus and histogram dropdowns
+        if hasattr(self, 'versus_x_combo'):
+            self.versus_x_combo['values'] = plotable_props
+        if hasattr(self, 'versus_y_combo'):
+            self.versus_y_combo['values'] = plotable_props
+        if hasattr(self, 'versus_color_combo'):
+            self.versus_color_combo['values'] = ["None"] + plotable_props
+        if hasattr(self, 'hist_prop_combo'):
+            self.hist_prop_combo['values'] = plotable_props
+
+    def _get_plotable_properties(self) -> List[str]:
+        """Get list of plotable properties from database."""
+        if not self.db:
+            return []
+        
+        plotable_props = []
+        for key in self.db.all_keys():
+            if key in ['path', 'processed']:
+                continue
+            
+            try:
+                unique_values = self.db.unique(key)
+                if len(unique_values) <= 1:
+                    continue
+                
+                if any(isinstance(v, (int, float, np.number)) and not (np.isnan(v) or np.isinf(v)) 
+                       for v in unique_values):
+                    plotable_props.append(key)
+            except Exception:
+                continue
+        
+        return sorted(plotable_props)
 
 
 def main():
     """Main entry point for the application."""
     root = tk.Tk()
-    
-    # Check for command-line argument specifying database file
-    db_file = None
-    if len(sys.argv) > 1:
-        db_file = sys.argv[1]
-    
-    app = ECAApp(root, db_file=db_file)
+    app = InstabApp(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
