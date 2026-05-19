@@ -1464,7 +1464,7 @@ class Fit(object):
         """Specify the bounds for each variable: (lower, upper) in the provided dict"""
         for v, b in bound_info.items():
             i = self.variables.index(v)
-            if i == -1: raise KeyError("Bounds were provided for non-existent variable {}".format(v))
+            if i == -1: raise KeyError(f"Bounds were provided for non-existent variable {v}")
             self.bounds_lower[i - 1] = b[0]
             self.bounds_upper[i - 1] = b[1]
 
@@ -1472,32 +1472,75 @@ class Fit(object):
         """Specify the initial guess for each variable: value"""
         for v, g in initial_info.items():
             i = self.variables.index(v)
-            if i == -1: raise KeyError("An inital value was provided for non-existent variable {}".format(v))
+            if i == -1: raise KeyError(f"An initial value was provided for non-existent variable {v}")
             self.initial_guess[i - 1] = g
 
     def fix(self, fix_info: dict):
         """Specify fixed values for each variable: value. They will not be optimized"""
         for v, f in fix_info.items():
             i = self.variables.index(v)
-            if i == -1: raise KeyError("An fixed value was provided for non-existent variable {}".format(v))
+            if i == -1: raise KeyError(f"A fixed value was provided for non-existent variable {v}")
             self.fixed[i - 1] = True
             self.fixed_values[i - 1] = f
 
     def limit_estimate(self, xdata: np.ndarray, ydata: np.ndarray) -> float:
-        """Estimate the limit of f(x) using the x and y data"""
+        """
+        Estimate the mathematical limit of f(x) using a stabilized, wide-range
+        linearized per-capita growth rate model across the active buildup phase.
+        """
         if len(ydata) == 0:
-            return 0
-        elif len(ydata) <= 5:
-            return ydata[-1]
-        smooth_diff = smooth(np.diff(ydata), max(ydata.size // 10, 5))
-        if np.mean(smooth_diff[-max(ydata.size // 10, 5):]) >= ydata[-1]*1e-2:
-            # We have likely not completed the buildup within the simulation window
-            return  (3 + (np.argmax(smooth_diff) / smooth_diff.size))*np.max(ydata)
-        else:
-            # Return an estimate based on the average slope in the last window
-            return min(np.mean(ydata[-5:-1]) + max(np.mean(smooth_diff[-max(ydata.size // 10, 5):]), 0), np.max(ydata))
+            return 0.0
+        if len(ydata) <= 5:
+            return float(ydata[-1])
 
-    def _mget(self, attr: str, model: ECModel, default: bool | float | int | np.number | np.ndarray = False):
+        # 1. Compute global numerical derivatives across the entire dataset
+        dx = np.diff(xdata)
+        dy = np.diff(ydata)
+        
+        # Avoid division by zero in x intervals
+        dydx = dy / np.where(dx == 0, 1e-12, dx)
+        y_mid = 0.5 * (ydata[:-1] + ydata[1:])
+
+        # 2. Establish a wide, high-signal mask to filter out numerical noise.
+        # We target the primary active growth zone (e.g., above 5% of max accumulation)
+        # where the derivative is positive and well above the noise floor.
+        max_y = np.max(ydata)
+        max_dydx = np.max(dydx)
+        
+        mask = (
+            (y_mid > max_y * 0.05) &      # Exclude noisy initial flat steps
+            (dydx > max_dydx * 0.01) &    # Exclude flat saturation tails where dy/dx -> 0
+            (y_mid < max_y * 0.95)        # Focus on the high-gradient region
+        )
+
+        # Ensure we have a statistically significant number of points to fit a line
+        if np.sum(mask) >= 5:
+            y_fit = y_mid[mask]
+            z_fit = dydx[mask] / y_fit  # Per-capita growth rate: z = (dy/dx) / y
+            
+            try:
+                # Linear regression over a wide, stable baseline: z = m * y + c
+                m, c = np.polyfit(y_fit, z_fit, 1)
+                if m < 0 and c > 0:
+                    asymptotic_limit = -c / m
+                    # Reject if the prediction is lower than what we've already recorded
+                    if asymptotic_limit > max_y:
+                        return float(asymptotic_limit)
+            except (np.linalg.LinAlgError, ValueError):
+                pass
+
+        # 3. Robust Fallback: Moving slope mechanics if the global fit diverges
+        smooth_diff = smooth(np.diff(ydata), max(ydata.size // 10, 5))
+        last_window = max(ydata.size // 10, 5)
+        mean_tail_slope = np.mean(smooth_diff[-last_window:])
+
+        if mean_tail_slope >= ydata[-1] * 1e-2:
+            # Curve is still aggressively climbing; project dynamically
+            return float((3.0 + (np.argmax(smooth_diff) / smooth_diff.size)) * max_y)
+        
+        return float(min(np.mean(ydata[-5:-1]) + max(mean_tail_slope, 0), max_y))
+
+    def _mget(self, attr: str, model: ECModel, default=False):
         return getattr(model, self.name+"_"+attr) if hasattr(model, "_"+self.name+"_"+attr) or hasattr(model, self.name+"_"+attr) else default
     
     def _mset(self, attr: str, value, model: ECModel):
@@ -1505,12 +1548,7 @@ class Fit(object):
         model._sync_set(self.name+"_"+attr, value)
 
     def _evaluate(self, code, names, f_mask, f_vals, x, *free_params):
-        """
-        Internal bridge that maps Scipy's (x, *free_params) call 
-        to the full set of variables required by the expression.
-        """
         eval_context = {"np": np, "scipy": scipy, names[0]: x}
-        # Reconstruct the full parameter list from free and fixed values
         free_ptr = 0
         for i, name in enumerate(names[1:]):
             if f_mask[i]:
@@ -1518,47 +1556,24 @@ class Fit(object):
             else:
                 eval_context[name] = free_params[free_ptr]
                 free_ptr += 1
-        # Use a restricted eval on the pre-compiled code object
         return eval(code, eval_context)
 
     def _make_target(self):
-        fixed_mask = self.fixed.copy()
-        fixed_vals = self.fixed_values.copy()
-        return functools_partial(
-            self._evaluate, 
-            self._compiled_fn, 
-            self.variables, 
-            fixed_mask, 
-            fixed_vals
-        )
+        return functools_partial(self._evaluate, self._compiled_fn, self.variables, self.fixed.copy(), self.fixed_values.copy())
 
     @property
     def full_names(self):
-        """
-        The full (database entry) names of each variable
-        """
         return np.array([(self.name+"_"+v, self.name+"_"+v+"_err") for v in self.variables[1:]], dtype=str)
 
     def select_data(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Picks data from the model to fit to.
-        """
         return self.selector.select(model)
 
     def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
-        """
-        Returns the X and Y scale factors for the provided data. Override.
-        """
         self._mset("scale_x", 1, model)
         self._mset("scale_y", 1, model)
         return (1, 1)
 
     def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
-        """
-        Apply the fit to the ECModel.
-        First checks for an existing fit, and skips fitting unless "refit" is True.
-        If the fit fails, the exception is stored as _furman_no_photo_fitting_error.
-        """
         if refit or (not self._mget("success", model)):
             try:
                 xdata, ydata = self.select_data(model)
@@ -1574,8 +1589,7 @@ class Fit(object):
                     ftol=1e-10
                 )
                 perr = np.sqrt(np.diag(covariance))
-                # Store the parameter values
-                f = 0 # Counter for free variables (index into result)
+                f = 0 
                 for i, v in enumerate(self.variables[1:]):
                     if self.fixed[i]:
                         self._mset(v, self.fixed_values[i], model)
@@ -1586,21 +1600,16 @@ class Fit(object):
                         f += 1
                 self._mset("success", True, model)
                 self._mset("train", self.selector.use_train, model)
-                if hasattr(model, "_data"): delattr(model, "_data")
-                if hasattr(model, "_smooth"): delattr(model, "_smooth")
-                if hasattr(model, "_smooth_diff"): delattr(model, "_smooth_diff")
+                for attr in ["_data", "_smooth", "_smooth_diff"]:
+                    if hasattr(model, attr): delattr(model, attr)
             except (RuntimeError, ValueError) as e:
                 self._mset("success", False, model)
-                setattr(model, "_"+self.name+"_fitting_error", str(e))
+                setattr(model, f"_{self.name}_fitting_error", str(e))
                 return None
             self._reset_state()
         return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
 
     def fit_function(self, model: ECModel, params: np.ndarray | None = None) -> Callable[..., float | np.number | np.ndarray]:
-        """
-        Returns a callable function of one variable, corresponding to the fit function.
-        Can optionally override the parameters.
-        """
         if params is None:
             params = self.fit(model)
             if params is None: raise RuntimeError("Cannot return a function for a failed fit!")
@@ -1610,7 +1619,6 @@ class Fit(object):
         if scale_x == False or scale_y == False or scale_y == 0:
             scale_x, scale_y = self.scale_factor(model, *self.select_data(model))
         target = self._make_target()
-        if params is None: raise RuntimeError("Cannot return a function for a failed fit!")
         fn = lambda x: target(scale_x * x, *params[~self.fixed]) / scale_y
         setattr(fn, "variables", self.variables)
         setattr(fn, "parameters", params)
@@ -1618,27 +1626,28 @@ class Fit(object):
         return fn
 
     def scrub(self, model: ECModel):
-        """
-        Remove all parameters of the fit from this model.
-        """
         for v in self.variables[1:]:
-            if hasattr(model, "_"+self.name+"_"+v):
-                delattr(model, self.name+"_"+v)
-            if hasattr(model, "_"+self.name+"_"+v+"_err"):
-                delattr(model, self.name+"_"+v+"_err")
-            if hasattr(model, "_"+self.name+"_success"):
-                delattr(model, self.name+"_success")
+            if hasattr(model, f"_{self.name}_{v}"): delattr(model, f"{self.name}_{v}")
+            if hasattr(model, f"_{self.name}_{v}_err"): delattr(model, f"{self.name}_{v}_err")
+        if hasattr(model, f"_{self.name}_success"): delattr(model, f"{self.name}_success")
 
 
-class FurmanNoPhotoFit(Fit):
+class FurmanBaseFit(Fit):
+    """
+    Intermediate base class consolidating common scale factors for all Furman EC variations.
+    """
+    def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
+        scale_x = np.reciprocal(model.b_spac)
+        scale_y = np.reciprocal(model.mean_intensity)
+        self._mset("scale_x", scale_x, model)
+        self._mset("scale_y", scale_y, model)
+        return (scale_x, scale_y)
+
+
+class FurmanNoPhotoFit(FurmanBaseFit):
     """
     "FURMAN" FULL MODEL (B) - NO PHOTOEMISSION
-    x  -> scaled time
-    yc -> Critical electron cloud density
-    b  -> Furman beta parameter (multipacting)
-    y0 -> [fixed] initial value = initial e- concentration
     """
-
     FURMAN_NO_PHOTO = """(y0 * yc * np.exp(beta * yc * x)) / (yc + y0 * (np.exp(beta * yc * x) - 1))"""
 
     def __init__(self, selector: None | DataSelector = None):
@@ -1649,56 +1658,41 @@ class FurmanNoPhotoFit(Fit):
             BunchAverageSelector() if selector is None else selector
         )
 
-    def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
-        scale_x = np.reciprocal(model.b_spac)
-        scale_y = np.reciprocal(model.mean_intensity)
-        self._mset("scale_x", scale_x, model)
-        self._mset("scale_y", scale_y, model)
-        return (scale_x, scale_y)
-    
     def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
         xdata, ydata = self.select_data(model)
         _, scale_y = self.scale_factor(model, xdata, ydata)
         self.fix({"y0": ydata[0] * scale_y})
+        
         if model.buildup:
             mslope = np.argmin(np.square(ydata - ((ydata[-1] - ydata[0])/2)))
+            limit_est_scaled = self.limit_estimate(xdata, ydata) * scale_y
+            
+            # Open the upper bound dynamically to avoid bounding cliff constraints
             bounds = {
-                "yc": (ydata[0] * scale_y, self.limit_estimate(xdata, ydata)*scale_y),
-                "beta": (0, 3*model.del_max)#max(5, 4*np.max(np.diff(ydata))/((ydata[-1]**2)*scale_y)))
+                "yc": (ydata[0] * scale_y, max(limit_est_scaled * 3.0, ydata[-1] * scale_y * 5.0)),
+                "beta": (0, 3 * model.del_max)
             }
             self.initial({
-                "yc": self.limit_estimate(xdata, ydata)*scale_y,
-                "beta": min(1, abs(4*np.mean(np.diff(ydata[mslope-2:mslope+2]))/((ydata[-1]**2)*scale_y)))
+                "yc": max(limit_est_scaled, ydata[-1] * scale_y * 1.05),
+                "beta": min(1, abs(4 * np.mean(np.diff(ydata[mslope-2:mslope+2])) / ((ydata[-1]**2) * scale_y)))
             })
         else:
-            bounds = {
-                "yc": (0, np.inf),
-                "beta": (-np.inf, 0)
-            }
-            self.initial({
-                "yc": 2*ydata[0]*scale_y,
-                "beta": -0.1
-            })
+            bounds = {"yc": (0, np.inf), "beta": (-np.inf, 0)}
+            self.initial({"yc": 2 * ydata[0] * scale_y, "beta": -0.1})
+            
         self.bound(bounds)
         return super().fit(model, refit)
 
-class FurmanNPMCFit(FurmanNoPhotoFit):
+
+class FurmanNPMCFit(FurmanBaseFit):
     """
     "FURMAN" NO PHOTOEMISSION MODEL WITH MAGNETIC CORRECTION
-    x  -> scaled time
-    yc -> Critical electron cloud density
-    b0 -> Furman beta parameter (multipacting)
-    b1 -> Magnetic correction
-    y0 -> [fixed] initial value = initial e- concentration
-
-    Solves the modified ODE dy/dx = (0) + (b0 + b1*x) * (yc - y(x)) * y(x)
     """
-
     FURMAN_NO_PHOTO_MC = "(y0 * yc * np.exp(yc*x*(b0 + 0.5*b1*x))) / (yc + y0 * (np.exp(yc*x*(b0 + 0.5*b1*x)) - 1))"
 
     def __init__(self, db: SimDB, selector: None | DataSelector = None):
         self.db = db
-        Fit.__init__(self,
+        super().__init__(
             "furman_npmc",
             FurmanNPMCFit.FURMAN_NO_PHOTO_MC,
             ("x", "yc", "b0", "b1", "y0"),
@@ -1706,104 +1700,135 @@ class FurmanNPMCFit(FurmanNoPhotoFit):
         )
     
     def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
+        # Composition: Bootstrapping baseline parameters from standard NoPhoto fit execution
         np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
         if np_result is None:
             self._mset("success", False, model)
-            setattr(model, "_"+self.name+"_fitting_error", "The underlying NoPhoto fit failed.")
+            setattr(model, f"_{self.name}_fitting_error", "The underlying NoPhoto fit failed.")
             return None
+            
         if list(model.B_multip) == [0]:
-            self.fix({
-                "y0": model.furman_np_y0,
-                "yc": model.furman_np_yc,
-                "b1": 0,
-            })
-            self.bound({"b0": (-2*abs(model.furman_np_beta), 2*abs(model.furman_np_beta))})
+            self.fix({"y0": model.furman_np_y0, "yc": model.furman_np_yc, "b1": 0})
+            self.bound({"b0": (-2 * abs(model.furman_np_beta), 2 * abs(model.furman_np_beta))})
             self.initial({"b0": model.furman_np_beta})
         else:
-            self.fix({
-                    "y0": model.furman_np_y0,
-                    "yc": model.furman_np_yc,
-                })
+            self.fix({"y0": model.furman_np_y0, "yc": model.furman_np_yc})
             base_search = self.db.where(doc_id=model.doc_id)[0]
             base_model = self.db.closest(base_search, photoemission=False, furman_np_success=True, B_multip=[0])
+            
             if len(base_model) != 0:
                 base_model = ECModel(model.db, base_model[0])
-                if base_model.furman_np_beta > 0:
-                    base_beta = base_model.furman_np_beta
-                else:
-                    base_beta = (model.furman_np_beta / 2)
-                self.initial({
-                    "b0": base_beta,
-                    "b1": 0
-                })
-                self.bound({
-                    "b0": (0, 2*base_beta),
-                    "b1": (-base_beta, base_beta),
-                })
+                base_beta = base_model.furman_np_beta if base_model.furman_np_beta > 0 else (model.furman_np_beta / 2)
+                self.initial({"b0": base_beta, "b1": 0})
+                self.bound({"b0": (0, 2 * base_beta), "b1": (-base_beta, base_beta)})
             else:
-                self.initial({
-                    "b0": 0.1,
-                    "b1": 0
-                })
-                self.bound({
-                    "b0": (0, np.inf),
-                    "b1": (-np.inf, np.inf),
-                })
-        return Fit.fit(self, model, refit)
+                self.initial({"b0": 0.1, "b1": 0})
+                self.bound({"b0": (0, np.inf), "b1": (-np.inf, np.inf)})
+                
+        return super().fit(model, refit)
 
-class FurmanPhotoFit(Fit):
-    """
-    "FURMAN" FULL MODEL (B) - NO PHOTOEMISSION
-    x  -> scaled time
-    yc -> Critical electron cloud density
-    a  -> Furman alpha parameter
-    b  -> Furman beta parameter (multipacting)
-    y0 -> [fixed] initial value = initial e- concentration
-    """
 
-    FURMAN_PHOTO = """0.5*(yc + np.sqrt(yc**2 + (4*alpha/beta))*np.tanh((x/2)*np.sqrt(beta*(4*alpha + (yc**2)*beta)) - np.arctanh((yc - 2*y0)*np.sqrt(beta / (4*alpha + (yc**2)*beta)))))"""
+class FurmanPhotoFit(FurmanBaseFit):
+    """
+    "FURMAN" FULL MODEL (B) - WITH PHOTOEMISSION
+    
+    Self-contained dual-expression execution. Leaves the base class unmodified.
+    """
+    # Nice, human-readable textbook formula for reporting and fit_function evaluation
+    FURMAN_PHOTO_READABLE = """0.5*(yc + np.sqrt(yc**2 + (4*alpha/beta))*np.tanh((x/2)*np.sqrt(beta*(4*alpha + (yc**2)*beta)) - np.arctanh((yc - 2*y0)*np.sqrt(beta / (4*alpha + (yc**2)*beta)))))"""
+
+    # High-performance exponential form for numerical solver stability
+    FURMAN_PHOTO_OPTIMIZED = (
+        "(lambda D: "
+        "  (lambda y_inf, y_neg: "
+        "    (lambda E: "
+        "      (y_inf * (y0 - y_neg) + y_neg * (y_inf - y0) * E) / "
+        "      np.where(((y0 - y_neg) + (y_inf - y0) * E) == 0, 1e-12, (y0 - y_neg) + (y_inf - y0) * E)"
+        "    )(np.exp(-beta * D * x))"
+        "  )(0.5 * (yc + D), 0.5 * (yc - D))"
+        ")(np.sqrt(yc**2 + 4.0 * alpha / np.where(beta == 0, 1e-12, beta)))"
+    )
 
     def __init__(self, selector: None | DataSelector = None):
+        # 1. Initialize standard behavior with the human-readable string
         super().__init__(
             "furman_p",
-            FurmanPhotoFit.FURMAN_PHOTO,
+            FurmanPhotoFit.FURMAN_PHOTO_READABLE,
             ("x", "yc", "alpha", "beta", "y0"),
             BunchAverageSelector() if selector is None else selector
         )
-
-    def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
-        scale_x = np.reciprocal(model.b_spac)
-        scale_y = np.reciprocal(model.mean_intensity)
-        self._mset("scale_x", scale_x, model)
-        self._mset("scale_y", scale_y, model)
-        return (scale_x, scale_y)
+        # 2. Compile the optimized version privately within this subclass
+        self._compiled_opt_fn = compile(FurmanPhotoFit.FURMAN_PHOTO_OPTIMIZED, "<furman_p_opt>", "eval")
     
     def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
-        xdata, ydata = self.select_data(model)
-        _, scale_y = self.scale_factor(model, xdata, ydata)
-        self.fix({"y0": ydata[0] * scale_y})
-        if model.buildup:
-            np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
-            if np_result is None:
-                self._mset("success", False, model)
-                setattr(model, "_"+self.name+"_fitting_error", "The underlying NoPhoto fit failed.")
-                return None
-            self.bound({
-                "yc": (ydata[0] * scale_y, max(self.limit_estimate(xdata, ydata)*scale_y, np_result[0,0])),
-                "alpha": (0, model.k_pe_st*scipy.constants.c*model.b_spac),
-                "beta": (0, max(np_result[0,1], 1))
-            })
-            self.initial({
-                "yc": self.limit_estimate(xdata, ydata)*scale_y,
-                "alpha": model.k_pe_st*scipy.constants.c*model.b_spac,
-                "beta": min(1, np_result[0,1])
-            })
-            return super().fit(model, refit)
-        else:
+        if not model.buildup:
             self._mset("success", False, model)
-            setattr(model, "_"+self.name+"_fitting_error", "Cannot fit photoemission model for non-buildup simulation.")
+            setattr(model, f"_{self.name}_fitting_error", "Cannot fit photoemission model for non-buildup simulation.")
             return None
+
+        xdata, ydata = self.select_data(model)
+        scale_x, scale_y = self.scale_factor(model, xdata, ydata)
         
+        X = xdata * scale_x
+        Y = ydata * scale_y
+        self.fix({"y0": Y[0]})
+        
+        # --- Intelligent Parameter Extraction Track ---
+        dX = np.diff(X)
+        dY = np.diff(Y)
+        dYdX = dY / np.where(dX == 0, 1e-12, dX)
+        Y_mid = 0.5 * (Y[:-1] + Y[1:])
+        
+        mask = (Y_mid < np.max(Y) * 0.92) & (dYdX > np.max(dYdX) * 0.02)
+        alpha_init = model.k_pe_st * scipy.constants.c * model.b_spac * 0.1
+        beta_init = 0.1
+        yc_init = self.limit_estimate(xdata, ydata) * scale_y
+        
+        if np.sum(mask) >= 6:
+            try:
+                a, b, c = np.polyfit(Y_mid[mask], dYdX[mask], 2)
+                if a < 0:
+                    beta_init = -a
+                    yc_init = b / beta_init
+                    alpha_init = max(c, 1e-8)
+            except (np.linalg.LinAlgError, ValueError):
+                pass
+
+        np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
+        if np_result is None:
+            self._mset("success", False, model)
+            setattr(model, f"_{self.name}_fitting_error", "The underlying NoPhoto fit failed.")
+            return None
+            
+        yc_baseline, beta_baseline = np_result[0, 0], np_result[0, 1]
+        alpha_max = model.k_pe_st * scipy.constants.c * model.b_spac
+
+        # --- Dynamic Bound Pinning ---
+        self.bound({
+            "yc": (Y[0], max(yc_init * 3.0, yc_baseline * 3.0, np.max(Y) * 5.0)),
+            "alpha": (0.0, max(alpha_max, alpha_init * 10.0, 1.0)),
+            "beta": (0.0, max(beta_baseline * 5, beta_init * 5, 10))
+        })
+        
+        self.initial({
+            "yc": max(yc_init, yc_baseline, np.max(Y) * 1.05),
+            "alpha": min(alpha_init, alpha_max * 0.9) if alpha_max > 0 else alpha_init,
+            "beta": min(beta_init, beta_baseline)
+        })
+        
+        # Cache the readable tracking function
+        original_compiled_fn = self._compiled_fn
+        # Force the base class to look at the robust exponential version during optimization
+        self._compiled_fn = self._compiled_opt_fn
+        
+        try:
+            # Executes Fit.fit() using the stable math block
+            result = super().fit(model, refit)
+        finally:
+            # Unconditionally restore the nice textbook formula for fit_function reporting
+            self._compiled_fn = original_compiled_fn
+            
+        return result
 
 def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True, **search):
     """

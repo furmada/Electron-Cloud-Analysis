@@ -232,9 +232,9 @@ class RunCondor(RunSLURM):
 universe = vanilla
 executable = $(dirname)/run.sh
 arguments = ""
-output = {afs_root}/$(dirname)/condor_out.txt
-error = {afs_root}/$(dirname)/condor_err.txt
-log = {afs_root}/$(dirname)/condor_log.txt
+output = condor_out.txt
+error = condor_err.txt
+log = {afs_root}/condor_log_$(ClusterId).txt
 should_transfer_files = YES
 transfer_input_files = $(dirname)/inputs.tgz
 transfer_output_files = output.tgz
