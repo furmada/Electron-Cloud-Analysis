@@ -1727,83 +1727,151 @@ class FurmanNPMCFit(FurmanBaseFit):
                 
         return super().fit(model, refit)
 
-
 class FurmanPhotoFit(FurmanBaseFit):
     """
     "FURMAN" FULL MODEL (B) - WITH PHOTOEMISSION
     
-    Self-contained dual-expression execution. Leaves the base class unmodified.
+    Optimized via a stable asymptotic lift reparameterization (delta = y_inf - yc)
+    to prevent ill-conditioned Jacobians and convergence failures when photoemission
+    is weak or negligible. Fully backward-compatible with the standard parameter space.
     """
-    # Nice, human-readable textbook formula for reporting and fit_function evaluation
+    # Textbook formula for reporting and fit_function evaluation
     FURMAN_PHOTO_READABLE = """0.5*(yc + np.sqrt(yc**2 + (4*alpha/beta))*np.tanh((x/2)*np.sqrt(beta*(4*alpha + (yc**2)*beta)) - np.arctanh((yc - 2*y0)*np.sqrt(beta / (4*alpha + (yc**2)*beta)))))"""
 
-    # High-performance exponential form for numerical solver stability
-    FURMAN_PHOTO_OPTIMIZED = (
-        "(lambda D: "
-        "  (lambda y_inf, y_neg: "
-        "    (lambda E: "
-        "      (y_inf * (y0 - y_neg) + y_neg * (y_inf - y0) * E) / "
-        "      np.where(((y0 - y_neg) + (y_inf - y0) * E) == 0, 1e-12, (y0 - y_neg) + (y_inf - y0) * E)"
-        "    )(np.exp(-beta * D * x))"
-        "  )(0.5 * (yc + D), 0.5 * (yc - D))"
-        ")(np.sqrt(yc**2 + 4.0 * alpha / np.where(beta == 0, 1e-12, beta)))"
-    )
-
     def __init__(self, selector: None | DataSelector = None):
-        # 1. Initialize standard behavior with the human-readable string
         super().__init__(
             "furman_p",
             FurmanPhotoFit.FURMAN_PHOTO_READABLE,
             ("x", "yc", "alpha", "beta", "y0"),
             BunchAverageSelector() if selector is None else selector
         )
-        # 2. Compile the optimized version privately within this subclass
-        self._compiled_opt_fn = compile(FurmanPhotoFit.FURMAN_PHOTO_OPTIMIZED, "<furman_p_opt>", "eval")
     
     def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
         if not model.buildup:
             self._mset("success", False, model)
             setattr(model, f"_{self.name}_fitting_error", "Cannot fit photoemission model for non-buildup simulation.")
             return None
-        xdata, ydata = self.select_data(model)
-        scale_x, scale_y = self.scale_factor(model, xdata, ydata)
-        X = xdata * scale_x
-        Y = ydata * scale_y
-        self.fix({"y0": Y[0]})
-        # --- Intelligent Parameter Extraction Track ---
-        dX = np.diff(X)
-        dY = np.diff(Y)
-        dYdX = dY / np.where(dX == 0, 1e-12, dX)
-        max_dydx = np.max(dYdX)
-        Y_mid = 0.5 * (Y[:-1] + Y[1:])
-        alpha_init = model.k_pe_st * scipy.constants.c * model.b_spac * 0.1
-        beta_init = max_dydx / max(Y[0] * (np.max(Y) - Y[0]), 1e-12)
-        yc_init = self.limit_estimate(xdata, ydata) * scale_y
 
-        alpha_max = model.k_pe_st * scipy.constants.c * model.b_spac
-        self.bound({
-            "yc": (Y[0], max(yc_init * 3.0, np.max(Y) * 5.0)),
-            "alpha": (0.0, max(alpha_max, alpha_init * 10.0, 1.0)),
-            "beta": (0.0, max(2*beta_init, 100))
-        })
-        self.initial({
-            "yc": max(yc_init, np.max(Y) * 1.05),
-            "alpha": min(alpha_init, alpha_max * 0.9) if alpha_max > 0 else alpha_init,
-            "beta": beta_init
-        })
-        
-        # Cache the readable tracking function
-        original_compiled_fn = self._compiled_fn
-        # Force the base class to look at the robust exponential version during optimization
-        self._compiled_fn = self._compiled_opt_fn
+        if not refit and self._mget("success", model):
+            return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
+
         try:
-            # Executes Fit.fit() using the stable math block
-            result = super().fit(model, refit)
-        finally:
-            # Unconditionally restore the nice textbook formula for fit_function reporting
-            self._compiled_fn = original_compiled_fn
+            xdata, ydata = self.select_data(model)
+            scale_x, scale_y = self.scale_factor(model, xdata, ydata)
             
-        return result
+            X = xdata * scale_x
+            Y = ydata * scale_y
+            y0_val = Y[0]
+            
+            # --- Step 1: Bootstrapping Baseline from No-Photo Model ---
+            np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
+            if np_result is None:
+                self._mset("success", False, model)
+                setattr(model, f"_{self.name}_fitting_error", "The underlying NoPhoto fit failed.")
+                return None
+                
+            yc_baseline, beta_baseline = np_result[0, 0], np_result[0, 1]
+            
+            # --- Step 2: Intelligent Initial Guessing via Polynomial Fit ---
+            dX = np.diff(X)
+            dY = np.diff(Y)
+            dYdX = dY / np.where(dX == 0, 1e-12, dX)
+            Y_mid = 0.5 * (Y[:-1] + Y[1:])
+            
+            mask = (Y_mid < np.max(Y) * 0.92) & (dYdX > np.max(dYdX) * 0.02)
+            alpha_init = model.k_pe_st * scipy.constants.c * model.b_spac * 0.1
+            beta_init = 0.1
+            yc_init = self.limit_estimate(xdata, ydata) * scale_y
+            
+            if np.sum(mask) >= 6:
+                try:
+                    a, b, c = np.polyfit(Y_mid[mask], dYdX[mask], 2)
+                    if a < 0:
+                        beta_init = -a
+                        yc_init = b / beta_init
+                        alpha_init = max(c, 1e-8)
+                except (np.linalg.LinAlgError, ValueError):
+                    pass
+
+            yc_p0 = max(yc_init, yc_baseline, np.max(Y) * 1.05)
+            beta_p0 = min(beta_init, beta_baseline)
+            alpha_p0 = min(alpha_init, model.k_pe_st * scipy.constants.c * model.b_spac * 0.9) if model.k_pe_st > 0 else alpha_init
+            alpha_p0 = max(alpha_p0, 1e-8)
+            
+            # Convert physical alpha guess into the stable delta parameter space
+            delta_p0 = 0.5 * (-yc_p0 + np.sqrt(yc_p0**2 + 4.0 * alpha_p0 / max(beta_p0, 1e-12)))
+            delta_p0 = max(delta_p0, 1e-8)
+
+            # --- Step 3: Define the Reparameterized Target Function ---
+            # This formulation maps delta = y_inf - yc, eliminating the square root from the core loop
+            def stable_delta_target(x, yc, delta, beta):
+                D = yc + 2.0 * delta
+                y_inf = yc + delta
+                y_neg = -delta
+                E = np.exp(-beta * D * x)
+                denom = (y0_val - y_neg) + (y_inf - y0_val) * E
+                return (y_inf * (y0_val - y_neg) + y_neg * (y_inf - y0_val) * E) / np.where(denom == 0, 1e-12, denom)
+
+            # --- Step 4: Execute Optimization ---
+            p0 = [yc_p0, delta_p0, beta_p0]
+            bounds_lower = [y0_val, 0.0, 0.0]
+            bounds_upper = [
+                max(yc_init * 3.0, yc_baseline * 3.0, np.max(Y) * 5.0), 
+                max(np.max(Y) * 5.0, 10.0), 
+                max(beta_baseline * 5, beta_init * 5, 10)
+            ]
+
+            result, covariance = scipy.optimize.curve_fit(
+                stable_delta_target,
+                X, Y,
+                p0=p0,
+                bounds=(bounds_lower, bounds_upper),
+                loss="arctan",
+                maxfev=int(1e5),
+                nan_policy="omit",
+                ftol=1e-10
+            )
+            
+            yc_fit, delta_fit, beta_fit = result
+            perr = np.sqrt(np.diag(covariance))
+            yc_err, delta_err, beta_err = perr
+            
+            # --- Step 5: Map Back to Physical Alpha with Complete Covariance Tracking ---
+            alpha_fit = beta_fit * (yc_fit + delta_fit) * delta_fit
+            
+            # Compute exact error propagation via Jacobian matrix multiplication
+            d_alpha_d_yc = beta_fit * delta_fit
+            d_alpha_d_delta = beta_fit * (yc_fit + 2.0 * delta_fit)
+            d_alpha_d_beta = (yc_fit + delta_fit) * delta_fit
+            
+            jacobian = np.array([d_alpha_d_yc, d_alpha_d_delta, d_alpha_d_beta])
+            alpha_var = jacobian @ covariance @ jacobian.T
+            alpha_err = np.sqrt(max(alpha_var, 0.0))
+
+            # --- Step 6: Sync back to standard model attributes ---
+            self._mset("yc", yc_fit, model)
+            self._mset("yc_err", yc_err, model)
+            self._mset("alpha", alpha_fit, model)
+            self._mset("alpha_err", alpha_err, model)
+            self._mset("beta", beta_fit, model)
+            self._mset("beta_err", beta_err, model)
+            self._mset("y0", y0_val, model)
+            self._mset("y0_err", 0, model)
+            
+            self._mset("success", True, model)
+            self._mset("train", self.selector.use_train, model)
+            
+            for attr in ["_data", "_smooth", "_smooth_diff"]:
+                if hasattr(model, attr): delattr(model, attr)
+                
+        except (RuntimeError, ValueError) as e:
+            self._mset("success", False, model)
+            setattr(model, f"_{self.name}_fitting_error", str(e))
+            return None
+            
+        self._reset_state()
+        return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
+
 
 def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True, **search):
     """
