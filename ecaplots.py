@@ -7,6 +7,7 @@ from scipy import signal as sp_signal
 import numpy as np
 from typing import Iterable
 
+# Global Matplotlib Configuration
 plt.rcParams['savefig.format'] = 'svg'
 plt.rcParams['figure.autolayout'] = False
 plt.rcParams['figure.constrained_layout.use'] = True
@@ -14,6 +15,7 @@ plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['font.size'] = 10
 
 def _axes(size: tuple[int, int] | None | Axes) -> Axes:
+    """Helper to handle polymorphic axes and figure sizing inputs."""
     if type(size) == tuple:
         plt.figure(figsize=size)
     if not isinstance(size, Axes):
@@ -119,35 +121,39 @@ def versus_plot(db: SimDB, paramA: str, paramB: str, colorBy: str | None = None,
     """
     ax = _axes(size)
     fig = plt.gcf()
+    cmap_to_use = plt.cm.viridis if colormap is None else colormap
     
     if colorBy is None:
-        # When no coloring variable is specified, just get X and Y data
         table = db.versus(paramA, paramB, **restrict)
         ax.scatter(
             table[0],
             table[1],
             s=dot_size,
-            cmap=plt.cm.viridis if colormap is None else colormap
+            cmap=cmap_to_use
         )
     else:
-        # When coloring by a variable, get X, Y, and color data
         table = db.versus(
             [paramA, paramA],
             [paramB, colorBy],
             **restrict
         )
+        
+        color_data = np.array(table[1][1])
+        vmin = np.nanmin(color_data) if len(color_data) > 0 else 0
+        vmax = np.nanmax(color_data) if len(color_data) > 0 else 1
+        
         ax.scatter(
             table[0][0],
             table[0][1],
-            c=table[1][1],
+            c=color_data,
             s=dot_size,
-            cmap=plt.cm.viridis if colormap is None else colormap
+            cmap=cmap_to_use
         )
-        fig.colorbar(plt.cm.ScalarMappable(norm=Normalize(vmin=min(table[1][1]), vmax=max(table[1][1])), cmap=plt.cm.viridis if colormap is None else colormap), ax=ax)
+        fig.colorbar(plt.cm.ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap=cmap_to_use), ax=ax)
     
     if log[0]: ax.set_xscale("log")
     if log[1]: ax.set_yscale("log")
-    if not size is None:
+    if size is not None:
         ax.set_xlabel(paramA)
         ax.set_ylabel(paramB)
         ax.set_title("{}({}){}".format(paramB, paramA, " by " + colorBy if colorBy is not None else ""))
@@ -161,14 +167,14 @@ def histogram_plot(db: SimDB, param: str, bins: int | str = 'auto',
     Produce a histogram of a specified parameter across the database, under restrict conditions.
     """
     ax = _axes(size)
-    # Extract the values for the requested parameter
     results = db.where(**restrict)
     values = [r[param] for r in results if param in r]
-    # Filter out non-numeric values or NaNs to prevent plotting errors
     valid_values = [v for v in values if isinstance(v, (int, float, np.number)) and not (np.isnan(v) or np.isinf(v))]
+    
     if not valid_values:
         ax.text(0.5, 0.5, f"No valid numeric data for {param}", ha='center', va='center')
         return None
+        
     n, bins_out, patches = ax.hist(valid_values, bins=bins, color=color, edgecolor='black', alpha=0.7)
     if log_y:
         ax.set_yscale("log")
@@ -196,21 +202,16 @@ def instability_grid_plot(db: SimDB, size: tuple[int, int] | None = (14, 16),
     if colormap is None:
         colormap = plt.cm.viridis
     
-    # Check if ANY model has slice data to decide layout
     has_slice_data = any(len(m.slice_mean_x) > 0 for m in models)
     
-    # FIX: Use 3 columns. Col 0 & 1 for plots, Col 2 for colorbar.
     n_rows = 3 if has_slice_data else 2
     fig = plt.figure(figsize=size)
     gs = gridspec.GridSpec(n_rows, 3, figure=fig, width_ratios=[1, 1, 0.15]) 
-    # width_ratios ensures the colorbar column is thin (15%) and plots are equal width
     
     # --- Create Axes ---
-    # Row 1: Centroids
     ax_cent_x = fig.add_subplot(gs[0, 0])
     ax_cent_y = fig.add_subplot(gs[0, 1], sharex=ax_cent_x, sharey=ax_cent_x)
     
-    # Row 2: RMS (conditional) or Emittance
     if has_slice_data:
         ax_rms_x = fig.add_subplot(gs[1, 0], sharex=ax_cent_x)
         ax_rms_y = fig.add_subplot(gs[1, 1], sharex=ax_cent_x)
@@ -227,7 +228,6 @@ def instability_grid_plot(db: SimDB, size: tuple[int, int] | None = (14, 16),
             'cent_x': ax_cent_x, 'cent_y': ax_cent_y,
         }
     
-    # Row 3/2: Emittance
     ax_eps_x = fig.add_subplot(gs[row_emittance, 0], sharex=ax_cent_x)
     ax_eps_y = fig.add_subplot(gs[row_emittance, 1], sharex=ax_cent_x)
     axes['eps_x'] = ax_eps_x
@@ -299,12 +299,12 @@ def instability_grid_plot(db: SimDB, size: tuple[int, int] | None = (14, 16),
 
     # --- Formatting ---
     labels = {
-        'cent_x': 'Horizontal Centroid / $\\sigma_x$',
-        'cent_y': 'Vertical Centroid / $\\sigma_y$',
+        'cent_x': r'Horizontal Centroid / $\sigma_x$',
+        'cent_y': r'Vertical Centroid / $\sigma_y$',
         'rms_x': 'Charge-weighted RMS X [a.u.]',
         'rms_y': 'Charge-weighted RMS Y [a.u.]',
-        'eps_x': 'Norm. Emittance X / $\\epsilon_{x,0}$',
-        'eps_y': 'Norm. Emittance Y / $\\epsilon_{y,0}$',
+        'eps_x': r'Norm. Emittance X / $\epsilon_{x,0}$',
+        'eps_y': r'Norm. Emittance Y / $\epsilon_{y,0}$',
     }
     
     for key, ax in axes.items():
@@ -315,17 +315,13 @@ def instability_grid_plot(db: SimDB, size: tuple[int, int] | None = (14, 16),
             ax.set_ylabel(labels[key], fontsize=11)
         ax.set_xlabel('Turns', fontsize=11)
 
-    # FIX: Create colorbar using the GridSpec column
-    # We create a dummy scatter plot to generate the colorbar mapping
     sm = plt.cm.ScalarMappable(cmap=colormap, norm=plt.Normalize(vmin=0, vmax=display_count-1))
     sm.set_array([])
     
-    # Create the colorbar axis from the GridSpec
-    cbar_ax = fig.add_subplot(gs[:, 2]) # Takes the full height of the 3rd column
+    cbar_ax = fig.add_subplot(gs[:, 2]) 
     cbar = plt.colorbar(sm, cax=cbar_ax)
     cbar.set_label('Simulation Index', fontsize=11)
     
-    # Title
     title_parts = []
     if len(results) > 0:
         r = results[0]
@@ -351,27 +347,8 @@ def growth_rate_vs_density_plot(db: SimDB, density_key: str = 'init_unif_edens_d
                                 **restrict):
     """
     Plots Growth Rate vs. Electron Density.
-    Replicates 002b_growth_rate_most_unstable.py with improvements.
-    
-    Parameters:
-    -----------
-    db : SimDB
-        Database of instability models
-    density_key : str
-        Database key for electron density
-    growth_key : str
-        Database key for growth rate
-    size : tuple
-        Figure size
-    save_path : str
-        Path to save figure
-    colormap : Colormap
-        Color scheme (default: viridis)
-    **restrict : dict
-        Database query restrictions
     """
     ax = _axes(size)
-    
     results = db.where(**restrict)
     densities = []
     rates = []
@@ -380,7 +357,6 @@ def growth_rate_vs_density_plot(db: SimDB, density_key: str = 'init_unif_edens_d
         if density_key in r and growth_key in r:
             d = r[density_key]
             g = r[growth_key]
-            # FIX #8: Filter NaNs and invalid values
             if isinstance(d, (int, float, np.number)) and isinstance(g, (int, float, np.number)):
                 if np.isfinite(g) and np.isfinite(d) and d > 0 and g > 0:
                     densities.append(d)
@@ -390,19 +366,17 @@ def growth_rate_vs_density_plot(db: SimDB, density_key: str = 'init_unif_edens_d
     rates = np.array(rates)
     
     if len(densities) > 0:
-        # Sort by density for clean line plot
         sort_idx = np.argsort(densities)
         densities = densities[sort_idx]
         rates = rates[sort_idx]
         
-        # FIX #6: Use colormap
         if colormap is None:
             colormap = plt.cm.viridis
         
         ax.semilogy(densities, rates, 'o-', linewidth=2.5, markersize=8, 
                    color=colormap(0.7), label='Growth Rate')
-        ax.set_xlabel('Electron Density [$e^-/m^3$]', fontsize=12)
-        ax.set_ylabel('Growth Rate [turn$^{-1}$]', fontsize=12)
+        ax.set_xlabel(r'Electron Density [$e^-/m^3$]', fontsize=12)
+        ax.set_ylabel(r'Growth Rate [turn$^{-1}$]', fontsize=12)
         ax.grid(True, linestyle='--', alpha=0.5)
         ax.set_xlim(left=min(densities)*0.9)
         ax.legend()
@@ -427,27 +401,8 @@ def blowup_time_vs_strength_plot(db: SimDB, strength_key: str = 'strength_factor
                                  **restrict):
     """
     Plots Blow-up Time vs. Strength Factor.
-    Replicates 002b_blowup_Turns_plot.py with improvements.
-    
-    Parameters:
-    -----------
-    db : SimDB
-        Database of instability models
-    strength_key : str
-        Database key for strength factor
-    turns_key : str
-        Database key for blowup turn
-    size : tuple
-        Figure size
-    save_path : str
-        Path to save figure
-    colormap : Colormap
-        Color scheme (default: viridis)
-    **restrict : dict
-        Database query restrictions
     """
     ax = _axes(size)
-    
     results = db.where(**restrict)
     strengths = []
     turns = []
@@ -456,7 +411,6 @@ def blowup_time_vs_strength_plot(db: SimDB, strength_key: str = 'strength_factor
         if strength_key in r and turns_key in r:
             s = r[strength_key]
             t = r[turns_key]
-            # FIX #8: Filter NaNs and invalid values
             if isinstance(s, (int, float, np.number)) and isinstance(t, (int, float, np.number)):
                 if np.isfinite(t) and np.isfinite(s) and s > 0:
                     strengths.append(s)
@@ -470,14 +424,12 @@ def blowup_time_vs_strength_plot(db: SimDB, strength_key: str = 'strength_factor
         strengths = strengths[sort_idx]
         turns = turns[sort_idx]
         
-        # FIX #6: Use colormap
         if colormap is None:
             colormap = plt.cm.viridis
         
         ax.semilogy(strengths, turns, 'o-', linewidth=3.5, markersize=10, 
                    color=colormap(0.7), label='Blowup Time')
         
-        # Draw limit line (e.g., 20000 turns)
         max_turns = np.nanmax(turns) if len(turns) > 0 else 20000
         limit = 20000
         if limit < max_turns:
@@ -508,22 +460,6 @@ def intrabunch_mode_heatmap(db: SimDB, model_idx: int = 0,
                             **restrict):
     """
     Plots the intra-bunch mode structure (Slice vs Turn) heatmap.
-    Similar to 003_intrabunch_modes.py.
-    
-    Parameters:
-    -----------
-    db : SimDB
-        Database of instability models
-    model_idx : int
-        Index of model to plot
-    size : tuple
-        Figure size
-    save_path : str
-        Path to save figure
-    colormap : Colormap
-        Color scheme (default: RdBu_r)
-    **restrict : dict
-        Database query restrictions
     """
     results = db.where(**restrict)
     if len(results) == 0:
@@ -544,39 +480,30 @@ def intrabunch_mode_heatmap(db: SimDB, model_idx: int = 0,
     
     fig, ax = plt.subplots(figsize=size)
     
-    # Data: (slices, turns)
-    # FIX #3: Validate shapes before using
     if model.slice_mean_x.ndim != 2:
         print("Slice data has unexpected shape.")
         return None
     
     signal = model.slice_mean_x
     
-    # Optionally weight by macroparticles
     if len(model.slice_n_macroparticles) > 0 and model.slice_n_macroparticles.shape == signal.shape:
         weights = model.slice_n_macroparticles
         signal = signal * weights / (np.mean(weights) + 1e-12)
     
-    # Normalize for better visualization
     signal_max = np.max(np.abs(signal))
-    if signal_max > 0:
-        signal_norm = signal / signal_max
-    else:
-        signal_norm = signal
+    signal_norm = signal / signal_max if signal_max > 0 else signal
     
-    # Create meshgrid
     n_slices, n_turns = signal.shape
-    z_axis = np.linspace(-1, 1, n_slices)  # Approximate z position (normalized)
+    z_axis = np.linspace(-1, 1, n_slices)  
     t_axis = np.arange(n_turns)
     
-    # Plot heatmap
     im = ax.pcolormesh(t_axis, z_axis, signal_norm, shading='auto', cmap=colormap)
     
     ax.set_xlabel('Turns', fontsize=12)
     ax.set_ylabel('Longitudinal Position (Normalized)', fontsize=12)
     ax.set_title(f'Intra-bunch Mode Structure (Sim {model_idx})', fontsize=13)
     
-    cbar = plt.colorbar(im, ax=ax, label='Normalized Signal')
+    plt.colorbar(im, ax=ax, label='Normalized Signal')
     ax.grid(True, linestyle='--', alpha=0.3)
     
     if save_path:
@@ -592,21 +519,6 @@ def instability_mode_evolution_plot(db: SimDB, model_idx: int = 0,
     """
     Plots the evolution of intra-bunch modes over time (Spectrogram).
     Highlights the dominant mode and its growth trajectory.
-    
-    Parameters:
-    -----------
-    db : SimDB
-        Database of instability models
-    model_idx : int
-        Index of the specific simulation to plot
-    size : tuple
-        Figure size
-    save_path : str
-        Path to save figure
-    colormap : Colormap
-        Color scheme (default: 'viridis')
-    **restrict : dict
-        Database query restrictions
     """
     results = db.where(**restrict)
     if len(results) == 0:
@@ -618,7 +530,6 @@ def instability_mode_evolution_plot(db: SimDB, model_idx: int = 0,
     
     model = InstabilityModel(db.db, results[model_idx])
     
-    # Trigger calculation
     power = model.slice_fft_power
     if len(power) == 0:
         print("No slice data or FFT calculation failed.")
@@ -632,35 +543,26 @@ def instability_mode_evolution_plot(db: SimDB, model_idx: int = 0,
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=size, gridspec_kw={'height_ratios': [3, 1]})
     
-    # --- Top: Spectrogram (Mode Power vs Time) ---
-    # Power shape: (Freq_Bins, Turns)
-    # We transpose to (Turns, Freq_Bins) for pcolormesh
     turns = np.arange(power.shape[1])
-    # Approximate frequency axis (fractional tune)
-    # Assuming window size 64, freqs = k/64
     freqs = np.arange(power.shape[0]) / 64.0 
     
-    # Normalize for visualization
     power_norm = np.log10(power + 1e-12)
     
-    im = ax1.pcolormesh(turns, freqs, power_norm.T[:-1,:-1], shading='auto', cmap=colormap)
+    im = ax1.pcolormesh(turns, freqs, power_norm.T[:-1, :-1], shading='auto', cmap=colormap)
     ax1.set_ylabel('Fractional Tune (Mode Index / 64)', fontsize=12)
     ax1.set_xlabel('Turns', fontsize=12)
-    ax1.set_title(f'Mode Evolution (Sim {model_idx}) - Growth Rate: {growth_rate:.4f} turn⁻¹', fontsize=13)
+    ax1.set_title(f'Mode Evolution (Sim {model_idx}) - Growth Rate: {growth_rate:.4f} ' r'turn$^{-1}$', fontsize=13)
     
-    # Highlight dominant mode
-    if dominant_idx > 0 and dominant_idx < len(freqs):
+    if 0 < dominant_idx < len(freqs):
         ax1.axhline(y=freqs[dominant_idx], color='white', linestyle='--', 
                     linewidth=2, label=f'Dominant Mode (idx={dominant_idx})')
         ax1.legend(loc='upper right')
     
-    cbar = plt.colorbar(im, ax=ax1, label='Log Power (a.u.)')
+    plt.colorbar(im, ax=ax1, label='Log Power (a.u.)')
     ax1.grid(True, linestyle='--', alpha=0.3, axis='x')
     
-    # --- Bottom: Dominant Mode Growth ---
     if dominant_idx > 0:
         dom_power = power[dominant_idx, :]
-        # Smooth for visibility
         if len(dom_power) > 20:
             dom_power_smooth = sp_signal.savgol_filter(dom_power, 21, 3)
         else:
