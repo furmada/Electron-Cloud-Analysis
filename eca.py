@@ -115,7 +115,7 @@ class TemplateSim(object):
     to generate new simulations by changing parameters.
     """
     def __init__(self, path: str):
-        self.path = os.path.normpath(os.path.abspath(path))
+        self.path = os.path.realpath(os.path.normpath(os.path.abspath(path)))
         self.property_map = {}
         self.defaults = {}
         for filename in DBFolder.FILENAMES.values():
@@ -140,6 +140,7 @@ class TemplateSim(object):
             os.mkdir(path)
 
         values = {**self.defaults, **changes}
+        skip_resource = set()
         for filename in DBFolder.FILENAMES.values():
             if filename != DBFolder.FILENAMES["data"]:
                 this_file = [prop for prop in values.keys() if prop in self.property_map and self.property_map[prop] == filename]
@@ -147,12 +148,14 @@ class TemplateSim(object):
                 for prop in sorted(this_file):
                     value = values[prop]
                     if type(value) == str and os.path.exists(value) and os.path.isfile(value):
-                        value = os.path.normpath(os.path.abspath(value))
+                        value = os.path.realpath(os.path.normpath(os.path.abspath(value)))
                         if os.path.commonpath((value, self.path)) != self.path:
                             # This is a filepath argument within the template. We also need this file.
                             rebase = os.path.join(path, os.path.basename(value))
                             copy2(value, rebase)
                             value = os.path.basename(rebase)
+                            if value in self.resources:
+                                skip_resource.add(value)
                     if prop == "logfile_path": value = "log.txt"
                     elif prop == "progress_path": value = "progress"
                     elif prop == "stopfile": value = "stop"
@@ -160,7 +163,8 @@ class TemplateSim(object):
                 with open(os.path.join(path, filename), "w") as f:
                     f.write(contents)
         for resource in self.resources:
-            copy2(os.path.join(self.path, resource), os.path.join(path, resource))
+            if resource not in skip_resource:
+                copy2(os.path.join(self.path, resource), os.path.join(path, resource))
         return path
 
     @staticmethod
@@ -715,6 +719,8 @@ class ECModel(SynchedEntry):
         """
         Convert time(s) to corresponding index(es) in the time array (floor-wise).
         """
+        if self.time.size <= 1:
+            return 0
         return np.floor(t / (self.time[1] - self.time[0])).astype(int)
 
     def train_to_index(self, train: int | np.integer) -> np.ndarray:
@@ -742,7 +748,10 @@ class ECModel(SynchedEntry):
         """
         True if multipacting buildup is detected
         """
-        self.buildup = np.mean(self.smooth_diff[:self.cutoff:self.bunch_step]) > 0
+        try:
+            self.buildup = np.mean(self.smooth_diff[:self.cutoff:self.bunch_step]) > 0
+        except:
+            self.buildup = False
 
     def gen_bunch_step(self):
         """
@@ -1259,56 +1268,32 @@ class Fit(object):
         Estimate the mathematical limit of f(x) using a stabilized, wide-range
         linearized per-capita growth rate model across the active buildup phase.
         """
-        if len(ydata) == 0:
-            return 0.0
-        if len(ydata) <= 5:
-            return float(ydata[-1])
-
-        # 1. Compute global numerical derivatives across the entire dataset
+        if len(ydata) == 0: return 0.0
+        if len(ydata) <= 5: return float(ydata[-1])
         dx = np.diff(xdata)
         dy = np.diff(ydata)
-        
-        # Avoid division by zero in x intervals
         dydx = dy / np.where(dx == 0, 1e-12, dx)
         y_mid = 0.5 * (ydata[:-1] + ydata[1:])
-
-        # 2. Establish a wide, high-signal mask to filter out numerical noise.
-        # We target the primary active growth zone (e.g., above 5% of max accumulation)
-        # where the derivative is positive and well above the noise floor.
         max_y = np.max(ydata)
         max_dydx = np.max(dydx)
-        
-        mask = (
-            (y_mid > max_y * 0.05) &      # Exclude noisy initial flat steps
-            (dydx > max_dydx * 0.01) &    # Exclude flat saturation tails where dy/dx -> 0
-            (y_mid < max_y * 0.95)        # Focus on the high-gradient region
-        )
-
-        # Ensure we have a statistically significant number of points to fit a line
+        mask = ((y_mid > max_y * 0.05) & (dydx > max_dydx * 0.01) & (y_mid < max_y * 0.95))
         if np.sum(mask) >= 5:
             y_fit = y_mid[mask]
-            z_fit = dydx[mask] / y_fit  # Per-capita growth rate: z = (dy/dx) / y
-            
+            z_fit = dydx[mask] / y_fit 
             try:
-                # Linear regression over a wide, stable baseline: z = m * y + c
                 m, c = np.polyfit(y_fit, z_fit, 1)
                 if m < 0 and c > 0:
                     asymptotic_limit = -c / m
-                    # Reject if the prediction is lower than what we've already recorded
                     if asymptotic_limit > max_y:
                         return float(asymptotic_limit)
             except (np.linalg.LinAlgError, ValueError):
                 pass
-
-        # 3. Robust Fallback: Moving slope mechanics if the global fit diverges
+        
         smooth_diff = smooth(np.diff(ydata), max(ydata.size // 10, 5))
         last_window = max(ydata.size // 10, 5)
         mean_tail_slope = np.mean(smooth_diff[-last_window:])
-
         if mean_tail_slope >= ydata[-1] * 1e-2:
-            # Curve is still aggressively climbing; project dynamically
             return float((3.0 + (np.argmax(smooth_diff) / smooth_diff.size)) * max_y)
-        
         return float(min(np.mean(ydata[-5:-1]) + max(mean_tail_slope, 0), max_y))
 
     def _mget(self, attr: str, model: ECModel, default=False):
@@ -1357,7 +1342,9 @@ class Fit(object):
                     loss="arctan",
                     maxfev=1e5,
                     nan_policy="omit",
-                    ftol=1e-10
+                    ftol=1e-10,
+                    xtol=1e-10,
+                    x_scale="jac"
                 )
                 perr = np.sqrt(np.diag(covariance))
                 f = 0 
@@ -1441,7 +1428,7 @@ class FurmanNoPhotoFit(FurmanBaseFit):
             # Open the upper bound dynamically to avoid bounding cliff constraints
             bounds = {
                 "yc": (ydata[0] * scale_y, max(limit_est_scaled * 3.0, ydata[-1] * scale_y * 5.0)),
-                "beta": (0, 3 * model.del_max)
+                "beta": (0, 3 * model.del_max if (not hasattr(model, "k_pe_st") or model.k_pe_st < 1e-6) else 10 * model.del_max)
             }
             self.initial({
                 "yc": max(limit_est_scaled, ydata[-1] * scale_y * 1.05),
@@ -1517,7 +1504,7 @@ class FurmanPhotoFit(FurmanBaseFit):
             BunchAverageSelector() if selector is None else selector
         )
     
-    def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
+    def fit(self, model, refit: bool = False) -> np.ndarray | None:
         if not model.buildup:
             self._mset("success", False, model)
             setattr(model, f"_{self.name}_fitting_error", "Cannot fit photoemission model for non-buildup simulation.")
@@ -1526,12 +1513,29 @@ class FurmanPhotoFit(FurmanBaseFit):
         if not refit and self._mget("success", model):
             return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
 
+        # --- IDEAS 2 & 3: Handle Zero Photoemission immediately to prevent parameter competition ---
+        if getattr(model, "k_pe_st", 0.0) <= 0:
+            np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
+            if np_result is None:
+                self._mset("success", False, model)
+                setattr(model, f"_{self.name}_fitting_error", "Zero-photoemission NoPhoto fallback failed.")
+                return None
+            
+            # Map No-Photo results (yc, beta, y0) directly and set alpha strictly to 0
+            for i, var in enumerate(["yc", "beta", "y0"]):
+                self._mset(var, np_result[0, i], model)
+                self._mset(var+"_err", np_result[1, i], model)
+                
+            self._mset("alpha", 0.0, model)
+            self._mset("alpha_err", 0.0, model)
+            self._mset("success", True, model)
+            return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
+
         try:
             xdata, ydata = self.select_data(model)
             scale_x, scale_y = self.scale_factor(model, xdata, ydata)
             
-            X = xdata * scale_x
-            Y = ydata * scale_y
+            X, Y = xdata * scale_x, ydata * scale_y
             y0_val = Y[0]
             
             # --- Step 1: Bootstrapping Baseline from No-Photo Model ---
@@ -1541,40 +1545,30 @@ class FurmanPhotoFit(FurmanBaseFit):
                 setattr(model, f"_{self.name}_fitting_error", "The underlying NoPhoto fit failed.")
                 return None
                 
-            yc_baseline, beta_baseline = np_result[0, 0], np_result[0, 1]
+            yc_baseline = np_result[0, 0] # Index 0,0 corresponds to the value of yc
             
-            # --- Step 2: Intelligent Initial Guessing via Polynomial Fit ---
+            # --- Step 2: Intelligent Initial Guessing via Growth Partitioning ---
             dX = np.diff(X)
             dY = np.diff(Y)
             dYdX = dY / np.where(dX == 0, 1e-12, dX)
-            Y_mid = 0.5 * (Y[:-1] + Y[1:])
             
-            mask = (Y_mid < np.max(Y) * 0.92) & (dYdX > np.max(dYdX) * 0.02)
-            alpha_init = model.k_pe_st * scipy.constants.c * model.b_spac * 0.1
-            beta_init = 0.1
-            yc_init = self.limit_estimate(xdata, ydata) * scale_y
+            # Partition initial steepness (alpha) vs max avalanche steepness (beta)
+            m0 = max(np.mean(dYdX[:max(1, len(dYdX)//20)]), 1e-12)
+            m_max = max(np.max(dYdX), m0 * 1.1)
             
-            if np.sum(mask) >= 6:
-                try:
-                    a, b, c = np.polyfit(Y_mid[mask], dYdX[mask], 2)
-                    if a < 0:
-                        beta_init = -a
-                        yc_init = b / beta_init
-                        alpha_init = max(c, 1e-8)
-                except (np.linalg.LinAlgError, ValueError):
-                    pass
+            yc_init = max(yc_baseline, np.max(Y) * 1.05)
+            
+            # Alpha is bounded physically by the initial slope
+            alpha_init = min(model.k_pe_st * scipy.constants.c * model.b_spac * 0.1, m0)
+            alpha_init = max(alpha_init, 1e-8)
+            
+            # Beta drives the rest of the peak steepness
+            beta_init = max(4.0 * (m_max - alpha_init) / (yc_init**2), 1e-8)
 
-            yc_p0 = max(yc_init, yc_baseline, np.max(Y) * 1.05)
-            beta_p0 = min(beta_init, beta_baseline)
-            alpha_p0 = min(alpha_init, model.k_pe_st * scipy.constants.c * model.b_spac * 0.9) if model.k_pe_st > 0 else alpha_init
-            alpha_p0 = max(alpha_p0, 1e-8)
-            
-            # Convert physical alpha guess into the stable delta parameter space
-            delta_p0 = 0.5 * (-yc_p0 + np.sqrt(yc_p0**2 + 4.0 * alpha_p0 / max(beta_p0, 1e-12)))
+            delta_p0 = 0.5 * (-yc_init + np.sqrt(yc_init**2 + 4.0 * alpha_init / beta_init))
             delta_p0 = max(delta_p0, 1e-8)
 
             # --- Step 3: Define the Reparameterized Target Function ---
-            # This formulation maps delta = y_inf - yc, eliminating the square root from the core loop
             def stable_delta_target(x, yc, delta, beta):
                 D = yc + 2.0 * delta
                 y_inf = yc + delta
@@ -1583,24 +1577,20 @@ class FurmanPhotoFit(FurmanBaseFit):
                 denom = (y0_val - y_neg) + (y_inf - y0_val) * E
                 return (y_inf * (y0_val - y_neg) + y_neg * (y_inf - y0_val) * E) / np.where(denom == 0, 1e-12, denom)
 
-            # --- Step 4: Execute Optimization ---
-            p0 = [yc_p0, delta_p0, beta_p0]
+            # --- Step 4: Execute Optimization (x_scale='jac' automatically applies via Fit.fit kwargs) ---
+            p0 = [yc_init, delta_p0, beta_init]
             bounds_lower = [y0_val, 0.0, 0.0]
             bounds_upper = [
-                max(yc_init * 3.0, yc_baseline * 3.0, np.max(Y) * 5.0), 
+                max(yc_init * 3.0, np.max(Y) * 5.0), 
                 max(np.max(Y) * 5.0, 10.0), 
-                max(beta_baseline * 5, beta_init * 5, 10)
+                max(beta_init * 10.0, 10.0)
             ]
 
             result, covariance = scipy.optimize.curve_fit(
-                stable_delta_target,
-                X, Y,
-                p0=p0,
+                stable_delta_target, X, Y, p0=p0,
                 bounds=(bounds_lower, bounds_upper),
-                loss="arctan",
-                maxfev=int(1e5),
-                nan_policy="omit",
-                ftol=1e-10
+                loss="arctan", maxfev=int(1e5), nan_policy="omit",
+                ftol=1e-12, xtol=1e-12, x_scale="jac"
             )
             
             yc_fit, delta_fit, beta_fit = result
@@ -1610,7 +1600,6 @@ class FurmanPhotoFit(FurmanBaseFit):
             # --- Step 5: Map Back to Physical Alpha with Complete Covariance Tracking ---
             alpha_fit = beta_fit * (yc_fit + delta_fit) * delta_fit
             
-            # Compute exact error propagation via Jacobian matrix multiplication
             d_alpha_d_yc = beta_fit * delta_fit
             d_alpha_d_delta = beta_fit * (yc_fit + 2.0 * delta_fit)
             d_alpha_d_beta = (yc_fit + delta_fit) * delta_fit
@@ -1620,17 +1609,13 @@ class FurmanPhotoFit(FurmanBaseFit):
             alpha_err = np.sqrt(max(alpha_var, 0.0))
 
             # --- Step 6: Sync back to standard model attributes ---
-            self._mset("yc", yc_fit, model)
-            self._mset("yc_err", yc_err, model)
-            self._mset("alpha", alpha_fit, model)
-            self._mset("alpha_err", alpha_err, model)
-            self._mset("beta", beta_fit, model)
-            self._mset("beta_err", beta_err, model)
-            self._mset("y0", y0_val, model)
-            self._mset("y0_err", 0, model)
+            self._mset("yc", yc_fit, model); self._mset("yc_err", yc_err, model)
+            self._mset("alpha", alpha_fit, model); self._mset("alpha_err", alpha_err, model)
+            self._mset("beta", beta_fit, model); self._mset("beta_err", beta_err, model)
+            self._mset("y0", y0_val, model); self._mset("y0_err", 0, model)
             
             self._mset("success", True, model)
-            self._mset("train", self.selector.use_train, model)
+            self._mset("train", getattr(self.selector, 'use_train', True), model)
             
             for attr in ["_data", "_smooth", "_smooth_diff"]:
                 if hasattr(model, attr): delattr(model, attr)
@@ -1649,10 +1634,10 @@ def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True
     For the database db, apply the Fit to each result of the search (using where()),
     returning an ECModel instance for each result.
     """
-    if not refit:
-        search = {**search, fit.name+"_success": False}
     results = db.where(**search)
     for i, result in enumerate(results):
+        if hasattr(result, fit.name+"_success") and (getattr(result, fit.name+"_success") == True) and (not refit):
+            continue
         try:
             model = ECModel(db.db, result)
             with np.errstate(divide="ignore", invalid="ignore", over="ignore"):

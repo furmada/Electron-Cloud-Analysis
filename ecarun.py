@@ -306,7 +306,7 @@ rm {} {} {}
             if os.path.exists(output_tar) and os.stat(output_tar).st_size > 0:
                 sp_run([
                     "tar", "-xzf", "output.tgz"
-                ], cwd=retrieve_folder)
+                ], cwd=retrieve_folder, capture_output=True)
                 os.remove(output_tar)
             print(f"{i}/{len(self.retrieve_folders)}", end="\r")
         print("Done.")

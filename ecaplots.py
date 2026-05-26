@@ -115,7 +115,7 @@ def model_plot(model: ECModel, fits: Iterable[Fit], size: tuple[int, int] | None
     ax.legend()
 
 def versus_plot(db: SimDB, paramA: str, paramB: str, colorBy: str | None = None, size: tuple[int, int] | None = (8, 6), 
-                dot_size: int = 10, log: tuple[bool, bool] = (False, False), colormap: None | Colormap = None, **restrict) -> tuple:
+                dot_size: int = 10, log: tuple[bool, bool] = (False, False), colormap: None | Colormap = None, **restrict):
     """
     Produce a plot of param B vs. paramA, optionally colored using param colorBy, under restrict conditions.
     """
