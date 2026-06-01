@@ -27,6 +27,9 @@ def unique_with_tolerance(arr, tol):
     # Split the sorted array at those indices and take the first element of each group
     return np.array([group[0] for group in np.split(arr, split_indices)])
 
+def realpath(path: str) -> str:
+    return os.path.realpath(os.path.expanduser(path))
+
 class DBFolder(object):
     """
     A source folder for building a database, containing non-instability simulations.
@@ -115,7 +118,7 @@ class TemplateSim(object):
     to generate new simulations by changing parameters.
     """
     def __init__(self, path: str):
-        self.path = os.path.realpath(os.path.normpath(os.path.abspath(path)))
+        self.path = realpath(path)
         self.property_map = {}
         self.defaults = {}
         for filename in DBFolder.FILENAMES.values():
@@ -133,7 +136,7 @@ class TemplateSim(object):
     
     def spawn(self, path: str, **changes) -> str:
         """Spawn a new simulation based on the template, with the changes applied."""
-        path = os.path.normpath(os.path.abspath(path))
+        path = realpath(path)
         if os.path.exists(path) and os.path.exists(os.path.join(path, DBFolder.FILENAMES["data"])):
             raise ValueError("The desired destination {} already contains an output data file!".format(path))
         if not os.path.exists(path):
@@ -148,7 +151,7 @@ class TemplateSim(object):
                 for prop in sorted(this_file):
                     value = values[prop]
                     if type(value) == str and os.path.exists(value) and os.path.isfile(value):
-                        value = os.path.realpath(os.path.normpath(os.path.abspath(value)))
+                        value = realpath(value)
                         if os.path.commonpath((value, self.path)) != self.path:
                             # This is a filepath argument within the template. We also need this file.
                             rebase = os.path.join(path, os.path.basename(value))
@@ -228,7 +231,7 @@ class SimDB(object):
     A database of PyECLOUD simulations that can be searched and queried.
     """
     def __init__(self, db_file: str | TinyDB, db_folders=[], verbose=True):
-        self.db = db_file if isinstance(db_file, TinyDB) else TinyDB(db_file, storage=CachingMiddleware(JSONStorage))
+        self.db = db_file if isinstance(db_file, TinyDB) else TinyDB(realpath(db_file), storage=CachingMiddleware(JSONStorage))
         self.verbose = verbose
         to_add = []
         for db_folder in db_folders:
@@ -299,6 +302,14 @@ class SimDB(object):
                 print(p, v, search[0][p])
             raise ValueError()
         return False
+
+    def insert(self, *documents: list[dict | Document]):
+        """
+        Manually insert document(s) into the database, for example when merging databases.
+        The validity or completeness of inserted documents is not checked!
+        """
+        for document in documents:
+            self.db.insert(document)
 
     def where(self, **search) -> list:
         """
@@ -1221,6 +1232,24 @@ class BunchAverageSelector(DataSelector):
         time = (model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid]
         return (time - time[0], averages)
 
+class MaskDataSelector(DataSelector):
+    """
+    Wraps an existing selector and applies a custom mask array.
+    """
+    def __init__(self, base_selector: DataSelector, mask: np.ndarray | Callable[[np.ndarray, np.ndarray], np.ndarray]):
+        self.base = base_selector
+        self.use_central_density = self.base.use_central_density
+        self.use_train = self.base.use_train
+        self.mask = mask
+    
+    def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
+        xdata, ydata = self.base.select(model)
+        if callable(self.mask):
+            mask = self.mask(xdata, ydata)
+        else:
+            mask = self.mask
+        return (xdata[mask], ydata[mask])
+
 class Fit(object):
     """
     A Fit is the base class for applying a curve fit to an ECModel.
@@ -1329,10 +1358,11 @@ class Fit(object):
         self._mset("scale_y", 1, model)
         return (1, 1)
 
-    def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
+    def fit(self, model: ECModel, refit: bool = False, xdata: np.ndarray | None = None, ydata: np.ndarray | None = None) -> np.ndarray | None:
         if refit or (not self._mget("success", model)):
             try:
-                xdata, ydata = self.select_data(model)
+                if xdata is None or ydata is None:
+                    xdata, ydata = self.select_data(model)
                 scale_x, scale_y = self.scale_factor(model, xdata, ydata)
                 result, covariance = scipy.optimize.curve_fit(
                     self._make_target(),
@@ -1404,42 +1434,77 @@ class FurmanBaseFit(Fit):
 
 class FurmanNoPhotoFit(FurmanBaseFit):
     """
-    "FURMAN" FULL MODEL (B) - NO PHOTOEMISSION
+    "FURMAN" MODEL - DYNAMIC REGIME (Logistic Buildup / Exponential Decay)
     """
-    FURMAN_NO_PHOTO = """(y0 * yc * np.exp(beta * yc * x)) / (yc + y0 * (np.exp(beta * yc * x) - 1))"""
+    FURMAN_BUILDUP = """(y0 * yc * np.exp(beta * yc * x)) / (yc + y0 * (np.exp(beta * yc * x) - 1))"""
+    FURMAN_DECAY = """y0 * np.exp(beta * yc * x)"""
 
     def __init__(self, selector: None | DataSelector = None):
+        # We start with the buildup string by default
         super().__init__(
             "furman_np",
-            FurmanNoPhotoFit.FURMAN_NO_PHOTO,
+            FurmanNoPhotoFit.FURMAN_BUILDUP,
             ("x", "yc", "beta", "y0"),
             BunchAverageSelector() if selector is None else selector
         )
 
-    def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
-        xdata, ydata = self.select_data(model)
-        _, scale_y = self.scale_factor(model, xdata, ydata)
-        self.fix({"y0": ydata[0] * scale_y})
-        
+    def fit(self, model: ECModel, refit: bool = False, xdata: np.ndarray | None = None, ydata: np.ndarray | None = None) -> np.ndarray | None:
+        if xdata is None or ydata is None:
+            xdata, ydata = self.select_data(model)
+            
         if model.buildup:
+            self.function = FurmanNoPhotoFit.FURMAN_BUILDUP
+            self._compiled_fn = compile(self.function, f"<{self.name}_fitfn>", "eval")
+            
+            scale_x, scale_y = self.scale_factor(model, xdata, ydata)
+            self.fix({"y0": ydata[0] * scale_y})
             mslope = np.argmin(np.square(ydata - ((ydata[-1] - ydata[0])/2)))
             limit_est_scaled = self.limit_estimate(xdata, ydata) * scale_y
-            
-            # Open the upper bound dynamically to avoid bounding cliff constraints
             bounds = {
                 "yc": (ydata[0] * scale_y, max(limit_est_scaled * 3.0, ydata[-1] * scale_y * 5.0)),
-                "beta": (0, 3 * model.del_max if (not hasattr(model, "k_pe_st") or model.k_pe_st < 1e-6) else 10 * model.del_max)
+                "beta": (1e-6, 3 * model.del_max if (not hasattr(model, "k_pe_st") or model.k_pe_st < 1e-6) else 10 * model.del_max)
             }
             self.initial({
                 "yc": max(limit_est_scaled, ydata[-1] * scale_y * 1.05),
                 "beta": min(1, abs(4 * np.mean(np.diff(ydata[mslope-2:mslope+2])) / ((ydata[-1]**2) * scale_y)))
             })
         else:
-            bounds = {"yc": (0, np.inf), "beta": (-np.inf, 0)}
-            self.initial({"yc": 2 * ydata[0] * scale_y, "beta": -0.1})
+            max_y_idx = np.argmax(ydata)
+            if max_y_idx > 0:
+                xdata = xdata[max_y_idx:]
+                ydata = ydata[max_y_idx:]
+            tail_floor = np.mean(ydata[-5:]) if len(ydata) >= 5 else ydata[-1]
+            total_drop = ydata[0] - tail_floor
+            if total_drop > 0:
+                clean_transient_mask = ydata >= (tail_floor + 0.15 * total_drop)
+                xdata = xdata[clean_transient_mask]
+                ydata = ydata[clean_transient_mask]
+            xdata = xdata - xdata[0] # Re-zero timeline for clean exponential evaluation
+            scale_x, scale_y = self.scale_factor(model, xdata, ydata)
+            self.function = FurmanNoPhotoFit.FURMAN_DECAY
+            self._compiled_fn = compile(self.function, f"<{self.name}_fitfn>", "eval")
             
+            y0_scaled = ydata[0] * scale_y
+            self.fix({"y0": y0_scaled})
+            if len(xdata) > 1 and ydata[1] > 0 and ydata[0] > 0:
+                dx = (xdata[1] - xdata[0]) * scale_x
+                gamma_est = (np.log(ydata[1]) - np.log(ydata[0])) / (dx if dx != 0 else 1e-12)
+            else:
+                gamma_est = -0.1
+            if gamma_est >= 0: 
+                gamma_est = -0.1
+            beta_init = 1.0 
+            yc_init = gamma_est / beta_init
+            bounds = {
+                "yc": (-np.inf, -1e-12),  # Strictly negative parameter boundary
+                "beta": (1e-6, np.inf)    # Retains positive interpretation continuity
+            }
+            self.initial({
+                "yc": yc_init,
+                "beta": beta_init
+            })
         self.bound(bounds)
-        return super().fit(model, refit)
+        return super().fit(model, refit, xdata, ydata)
 
 
 class FurmanNPMCFit(FurmanBaseFit):
@@ -1457,7 +1522,7 @@ class FurmanNPMCFit(FurmanBaseFit):
             BunchAverageSelector() if selector is None else selector
         )
     
-    def fit(self, model: ECModel, refit: bool = False) -> np.ndarray | None:
+    def fit(self, model: ECModel, refit: bool = False, xdata: np.ndarray | None = None, ydata: np.ndarray | None = None) -> np.ndarray | None:
         # Composition: Bootstrapping baseline parameters from standard NoPhoto fit execution
         np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
         if np_result is None:
@@ -1483,7 +1548,7 @@ class FurmanNPMCFit(FurmanBaseFit):
                 self.initial({"b0": 0.1, "b1": 0})
                 self.bound({"b0": (0, np.inf), "b1": (-np.inf, np.inf)})
                 
-        return super().fit(model, refit)
+        return super().fit(model, refit, xdata, ydata)
 
 class FurmanPhotoFit(FurmanBaseFit):
     """
@@ -1504,7 +1569,7 @@ class FurmanPhotoFit(FurmanBaseFit):
             BunchAverageSelector() if selector is None else selector
         )
     
-    def fit(self, model, refit: bool = False) -> np.ndarray | None:
+    def fit(self, model, refit: bool = False, xdata: np.ndarray | None = None, ydata: np.ndarray | None = None) -> np.ndarray | None:
         if not model.buildup:
             self._mset("success", False, model)
             setattr(model, f"_{self.name}_fitting_error", "Cannot fit photoemission model for non-buildup simulation.")
