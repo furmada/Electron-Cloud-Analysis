@@ -144,7 +144,9 @@ def make_matfiles(Z: float, zslice: np.ndarray, output_dir: str = "output", k_pe
     """
     x_b, y_b, f_b = zslice[0], zslice[1], zslice[2]
     # Compute the segment lengths
-    seg_len = np.sqrt(np.diff(x_b, append=x_b[0])**2 + np.diff(y_b, append=y_b[0])**2)
+    seg_len: Unknown = np.sqrt(np.diff(x_b, append=x_b[0])**2 + np.diff(y_b, append=y_b[0])**2)
+    # Total Flux
+    total_flux = float(np.sum(f_b * seg_len))
     # Compute the length-weighted flux distribution
     cumdist = np.cumsum((f_b * seg_len) / (np.sum(f_b * seg_len)))
     # Fit ellipse
@@ -166,6 +168,7 @@ def make_matfiles(Z: float, zslice: np.ndarray, output_dir: str = "output", k_pe
         photo_dict = {
             "phem_cdf": cumdist,
             "k_pe_st": k_pe_st,
+            "total_flux": total_flux,
             **vtx_dict
         }
         chm_file = join(output_dir, output_chm)

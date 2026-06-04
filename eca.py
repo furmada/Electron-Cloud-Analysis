@@ -786,7 +786,10 @@ class ECModel(SynchedEntry):
         """
         The true half-width of the simulated Gaussian bunch.
         """
-        self.half_bunch = self.t_offs - self.time[np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]]
+        if self.time.size == 0 or self.time[-1] <= self.t_offs:
+            self.half_bunch = self.t_offs
+        else:
+            self.half_bunch = self.t_offs - self.time[np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]]
 
     def gen_magnet(self):
         """
@@ -1198,9 +1201,7 @@ class InstabilityModel(SynchedEntry):
         return self
 
 class DataSelector(object):
-    """
-    A DataSelector chooses data for fitting or other analysis from an ECModel.
-    """
+    """A DataSelector chooses data for fitting or other analysis from an ECModel."""
     def __init__(self, use_central_density: bool = False, use_train: int = -1):
         self.use_central_density = use_central_density
         self.use_train = use_train
@@ -1210,32 +1211,22 @@ class DataSelector(object):
         return (model.time[train], model.central_density[train] if self.use_central_density else model.N_electrons[train])
 
 class BeforeBunchSelector(DataSelector):
-    """
-    Selects the points immediately before each bunch passage as the fitting points.
-    """
+    """Selects the points immediately before each bunch passage as the fitting points."""
     def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        pre_bp = np.array(model.time_to_index(model.bunch_times[model.train_to_bunches(self.use_train)] - model.half_bunch))
-        time = model.time[pre_bp]
-        return (time - time[0], (model.central_density if self.use_central_density else model.N_electrons)[pre_bp])
+        idx = np.array(model.time_to_index(model.bunch_times[model.train_to_bunches(self.use_train)] - model.half_bunch))
+        return (model.time[idx] - model.time[idx[0]], (model.central_density if self.use_central_density else model.N_electrons)[idx])
 
 class BunchAverageSelector(DataSelector):
-    """
-    Selects the points immediately before each bunch passage as the fitting points.
-    """
+    """Selects the average points within the bunch step spacing interval."""
     def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
         valid = model.train_to_bunches(self.use_train)
-        pre_bp = np.array(model.time_to_index(model.bunch_times[valid] - model.half_bunch))
-        averages = np.zeros_like(pre_bp)
-        for b, start in enumerate(pre_bp):
-            averages[b] = np.mean(
-                (model.central_density if self.use_central_density else model.N_electrons)[start:start+model.bunch_step])
-        time = (model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid]
-        return (time - time[0], averages)
+        idx = np.array(model.time_to_index(model.bunch_times[valid] - model.half_bunch))
+        y_src = model.central_density if self.use_central_density else model.N_electrons
+        t = (model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid]
+        return (t - t[0], np.array([np.mean(y_src[s : s + model.bunch_step]) for s in idx]))
 
 class MaskDataSelector(DataSelector):
-    """
-    Wraps an existing selector and applies a custom mask array.
-    """
+    """Wraps an existing selector and applies a custom mask array."""
     def __init__(self, base_selector: DataSelector, mask: np.ndarray | Callable[[np.ndarray, np.ndarray], np.ndarray]):
         self.base = base_selector
         self.use_central_density = self.base.use_central_density
@@ -1244,16 +1235,11 @@ class MaskDataSelector(DataSelector):
     
     def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
         xdata, ydata = self.base.select(model)
-        if callable(self.mask):
-            mask = self.mask(xdata, ydata)
-        else:
-            mask = self.mask
+        mask = self.mask(xdata, ydata) if callable(self.mask) else self.mask
         return (xdata[mask], ydata[mask])
 
 class Fit(object):
-    """
-    A Fit is the base class for applying a curve fit to an ECModel.
-    """
+    """A Fit is the base class for applying a curve fit to an ECModel."""
     def __init__(self, name: str, function: str, variables: Iterable[str], selector: DataSelector):
         self.name = name
         self.function = function
@@ -1270,60 +1256,90 @@ class Fit(object):
         self.fixed_values = np.zeros_like(self.initial_guess)
 
     def bound(self, bound_info: dict):
-        """Specify the bounds for each variable: (lower, upper) in the provided dict"""
         for v, b in bound_info.items():
-            i = self.variables.index(v)
-            if i == -1: raise KeyError(f"Bounds were provided for non-existent variable {v}")
-            self.bounds_lower[i - 1] = b[0]
-            self.bounds_upper[i - 1] = b[1]
+            if (i := self.variables.index(v)) != -1:
+                self.bounds_lower[i - 1], self.bounds_upper[i - 1] = b[0], b[1]
 
     def initial(self, initial_info: dict):
-        """Specify the initial guess for each variable: value"""
         for v, g in initial_info.items():
-            i = self.variables.index(v)
-            if i == -1: raise KeyError(f"An initial value was provided for non-existent variable {v}")
-            self.initial_guess[i - 1] = g
+            if (i := self.variables.index(v)) != -1:
+                self.initial_guess[i - 1] = g
 
     def fix(self, fix_info: dict):
-        """Specify fixed values for each variable: value. They will not be optimized"""
         for v, f in fix_info.items():
-            i = self.variables.index(v)
-            if i == -1: raise KeyError(f"A fixed value was provided for non-existent variable {v}")
-            self.fixed[i - 1] = True
-            self.fixed_values[i - 1] = f
+            if (i := self.variables.index(v)) != -1:
+                self.fixed[i - 1], self.fixed_values[i - 1] = True, f
 
     def limit_estimate(self, xdata: np.ndarray, ydata: np.ndarray) -> float:
         """
-        Estimate the mathematical limit of f(x) using a stabilized, wide-range
-        linearized per-capita growth rate model across the active buildup phase.
+        Estimates or constrains the mathematical saturation limit yc.
+        
+        Resolves late buildup starts by isolating the active signal window.
+        Adapts structurally to both FurmanNoPhoto (geometric inversion) and 
+        FurmanPhoto (quadratic Riccati root-finding) regimes.
         """
-        if len(ydata) == 0: return 0.0
-        if len(ydata) <= 5: return float(ydata[-1])
-        dx = np.diff(xdata)
-        dy = np.diff(ydata)
-        dydx = dy / np.where(dx == 0, 1e-12, dx)
-        y_mid = 0.5 * (ydata[:-1] + ydata[1:])
-        max_y = np.max(ydata)
-        max_dydx = np.max(dydx)
-        mask = ((y_mid > max_y * 0.05) & (dydx > max_dydx * 0.01) & (y_mid < max_y * 0.95))
-        if np.sum(mask) >= 5:
-            y_fit = y_mid[mask]
-            z_fit = dydx[mask] / y_fit 
+        if (n := len(ydata)) == 0: return 0.0
+        max_y = float(np.max(ydata))
+        if n <= 5 or max_y == 0: return max_y
+        
+        # 1. Compute derivatives globally for terminal tail checks
+        dydx = np.diff(ydata) / np.where(np.diff(xdata) == 0, 1e-12, np.diff(xdata))
+        tail_growth = np.mean(dydx[-3:])
+        
+        # Curve has naturally flattened or turned downward -> Already saturated
+        if tail_growth <= 0.02 * np.max(dydx) or tail_growth <= 0:
+            return max_y
+
+        # 2. Isolate the Active Buildup Zone (Fixes the late-start edge case)
+        # Define active zone where density has risen above a baseline floor (e.g., 2%)
+        active_mask = ydata > 0.02 * max_y
+        active_idx = np.where(active_mask)[0]
+        
+        if len(active_idx) < 5: 
+            return max_y * 1.5  # Not enough active points to extract curvature reliably
+
+        # Slice data down to the active horizon
+        y_active = ydata[active_idx]
+        x_active = xdata[active_idx]
+        dydx_active = dydx[active_idx[:-1]]  # Align derivative length
+        y_mid_active = 0.5 * (y_active[:-1] + y_active[1:])
+        
+        n_act = len(y_active)
+
+        if getattr(self, 'photoem_flag', 0) > 0:
+            # --- PHOTOEMISSION REGIME (Riccati Quadratic Fit) ---
             try:
-                m, c = np.polyfit(y_fit, z_fit, 1)
-                if m < 0 and c > 0:
-                    asymptotic_limit = -c / m
-                    if asymptotic_limit > max_y:
-                        return float(asymptotic_limit)
+                # Fit: dydx = p0*y^2 + p1*y + p2
+                p = np.polyfit(y_mid_active, dydx_active, 2)
+                
+                # For a stable saturating curve, the y^2 coefficient must be negative
+                if p[0] < 0:
+                    roots = np.roots(p)
+                    # We want the real root that represents forward saturation (yc > max_y)
+                    valid_roots = roots[np.isreal(roots) & (roots > max_y)]
+                    if len(valid_roots) > 0:
+                        return float(np.clip(np.min(valid_roots), max_y, max_y * 5.0))
             except (np.linalg.LinAlgError, ValueError):
                 pass
-        
-        smooth_diff = smooth(np.diff(ydata), max(ydata.size // 10, 5))
-        last_window = max(ydata.size // 10, 5)
-        mean_tail_slope = np.mean(smooth_diff[-last_window:])
-        if mean_tail_slope >= ydata[-1] * 1e-2:
-            return float((3.0 + (np.argmax(smooth_diff) / smooth_diff.size)) * max_y)
-        return float(min(np.mean(ydata[-5:-1]) + max(mean_tail_slope, 0), max_y))
+            
+            return max_y * 2.0  # Photoemission fallback (generally higher/faster scaling)
+
+        else:
+            # --- NO-PHOTOEMISSION REGIME (3-Point Geometric Inversion) ---
+            # Sample 3 perfectly evenly spaced points strictly *within* the active window
+            k = (n_act - 1) // 2
+            y1 = y_active[n_act - 1 - 2 * k]
+            y2 = y_active[n_act - 1 - k]
+            y3 = y_active[n_act - 1]
+            
+            denom = y1 * y3 - y2**2
+            
+            if denom < 0:  # Confirms curve is concave/decelerating toward a ceiling
+                yc_alg = (2 * y1 * y2 * y3 - y2**2 * (y1 + y3)) / denom
+                if yc_alg > max_y:
+                    return float(min(yc_alg, max_y * 5.0))
+                    
+            return max_y * 1.5
 
     def _mget(self, attr: str, model: ECModel, default=False):
         return getattr(model, self.name+"_"+attr) if hasattr(model, "_"+self.name+"_"+attr) or hasattr(model, self.name+"_"+attr) else default
@@ -1353,10 +1369,10 @@ class Fit(object):
     def select_data(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
         return self.selector.select(model)
 
-    def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
+    def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float, float]:
         self._mset("scale_x", 1, model)
         self._mset("scale_y", 1, model)
-        return (1, 1)
+        return (1.0, 1.0)
 
     def fit(self, model: ECModel, refit: bool = False, xdata: np.ndarray | None = None, ydata: np.ndarray | None = None) -> np.ndarray | None:
         if refit or (not self._mget("success", model)):
@@ -1365,26 +1381,18 @@ class Fit(object):
                     xdata, ydata = self.select_data(model)
                 scale_x, scale_y = self.scale_factor(model, xdata, ydata)
                 result, covariance = scipy.optimize.curve_fit(
-                    self._make_target(),
-                    scale_x * xdata, scale_y * ydata,
+                    self._make_target(), scale_x * xdata, scale_y * ydata,
                     p0=self.initial_guess[~self.fixed],
                     bounds=(self.bounds_lower[~self.fixed], self.bounds_upper[~self.fixed]),
-                    loss="arctan",
-                    maxfev=1e5,
-                    nan_policy="omit",
-                    ftol=1e-10,
-                    xtol=1e-10,
-                    x_scale="jac"
+                    loss="arctan", maxfev=int(1e5), nan_policy="omit", ftol=1e-10, xtol=1e-10, x_scale="jac"
                 )
                 perr = np.sqrt(np.diag(covariance))
                 f = 0 
                 for i, v in enumerate(self.variables[1:]):
                     if self.fixed[i]:
-                        self._mset(v, self.fixed_values[i], model)
-                        self._mset(v+"_err", 0, model)
+                        self._mset(v, self.fixed_values[i], model); self._mset(v+"_err", 0, model)
                     else:
-                        self._mset(v, result[f], model)
-                        self._mset(v+"_err", perr[f], model)
+                        self._mset(v, result[f], model); self._mset(v+"_err", perr[f], model)
                         f += 1
                 self._mset("success", True, model)
                 self._mset("train", self.selector.use_train, model)
@@ -1397,14 +1405,13 @@ class Fit(object):
             self._reset_state()
         return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
 
-    def fit_function(self, model: ECModel, params: np.ndarray | None = None) -> Callable[..., float | np.number | np.ndarray]:
+    def fit_function(self, model: ECModel, params: np.ndarray | None = None) -> Callable[..., np.ndarray]:
         if params is None:
-            params = self.fit(model)
-            if params is None: raise RuntimeError("Cannot return a function for a failed fit!")
-            params = params[0]
+            if (p_fit := self.fit(model)) is None: raise RuntimeError("Cannot return a function for a failed fit!")
+            params = p_fit[0]
         scale_x = self._mget("scale_x", model, default=1)
         scale_y = self._mget("scale_y", model, default=1)
-        if scale_x == False or scale_y == False or scale_y == 0:
+        if not scale_x or not scale_y:
             scale_x, scale_y = self.scale_factor(model, *self.select_data(model))
         target = self._make_target()
         fn = lambda x: target(scale_x * x, *params[~self.fixed]) / scale_y
@@ -1421,111 +1428,77 @@ class Fit(object):
 
 
 class FurmanBaseFit(Fit):
-    """
-    Intermediate base class consolidating common scale factors for all Furman EC variations.
-    """
-    def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float | int | np.number, float | int | np.number]:
-        scale_x = np.reciprocal(model.b_spac)
-        scale_y = np.reciprocal(model.mean_intensity)
+    """Intermediate base class consolidating common scale factors for all Furman variations."""
+    def scale_factor(self, model: ECModel, xdata: np.ndarray, ydata: np.ndarray) -> tuple[float, float]:
+        scale_x, scale_y = np.reciprocal(model.b_spac), np.reciprocal(model.mean_intensity)
         self._mset("scale_x", scale_x, model)
         self._mset("scale_y", scale_y, model)
         return (scale_x, scale_y)
 
 
 class FurmanNoPhotoFit(FurmanBaseFit):
-    """
-    "FURMAN" MODEL - DYNAMIC REGIME (Logistic Buildup / Exponential Decay)
-    """
+    """Logistic Buildup / Exponential Decay Variant assuming zero photoemission."""
     FURMAN_BUILDUP = """(y0 * yc * np.exp(beta * yc * x)) / (yc + y0 * (np.exp(beta * yc * x) - 1))"""
     FURMAN_DECAY = """y0 * np.exp(beta * yc * x)"""
 
     def __init__(self, selector: None | DataSelector = None):
-        # We start with the buildup string by default
-        super().__init__(
-            "furman_np",
-            FurmanNoPhotoFit.FURMAN_BUILDUP,
-            ("x", "yc", "beta", "y0"),
-            BunchAverageSelector() if selector is None else selector
-        )
+        super().__init__("furman_np", self.FURMAN_BUILDUP, ("x", "yc", "beta", "y0"), BunchAverageSelector() if selector is None else selector)
 
     def fit(self, model: ECModel, refit: bool = False, xdata: np.ndarray | None = None, ydata: np.ndarray | None = None) -> np.ndarray | None:
         if xdata is None or ydata is None:
             xdata, ydata = self.select_data(model)
             
         if model.buildup:
-            self.function = FurmanNoPhotoFit.FURMAN_BUILDUP
+            self.function = self.FURMAN_BUILDUP
             self._compiled_fn = compile(self.function, f"<{self.name}_fitfn>", "eval")
-            
             scale_x, scale_y = self.scale_factor(model, xdata, ydata)
             self.fix({"y0": ydata[0] * scale_y})
+            
+            lim_est_scaled = self.limit_estimate(xdata, ydata) * scale_y
+            max_y_scaled = np.max(ydata) * scale_y
+            
+            self.bound({
+                "yc": (ydata[0] * scale_y, max(lim_est_scaled, max_y_scaled * 1.001)),
+                "beta": (1e-6, 3 * model.del_max if getattr(model, "k_pe_st", 0) < 1e-6 else 10 * model.del_max)
+            })
             mslope = np.argmin(np.square(ydata - ((ydata[-1] - ydata[0])/2)))
-            limit_est_scaled = self.limit_estimate(xdata, ydata) * scale_y
-            bounds = {
-                "yc": (ydata[0] * scale_y, max(limit_est_scaled * 3.0, ydata[-1] * scale_y * 5.0)),
-                "beta": (1e-6, 3 * model.del_max if (not hasattr(model, "k_pe_st") or model.k_pe_st < 1e-6) else 10 * model.del_max)
-            }
             self.initial({
-                "yc": max(limit_est_scaled, ydata[-1] * scale_y * 1.05),
-                "beta": min(1, abs(4 * np.mean(np.diff(ydata[mslope-2:mslope+2])) / ((ydata[-1]**2) * scale_y)))
+                "yc": lim_est_scaled,
+                "beta": min(1.0, abs(4 * np.mean(np.diff(ydata[mslope-2:mslope+2])) / ((ydata[-1]**2) * scale_y)))
             })
         else:
-            max_y_idx = np.argmax(ydata)
-            if max_y_idx > 0:
-                xdata = xdata[max_y_idx:]
-                ydata = ydata[max_y_idx:]
-            tail_floor = np.mean(ydata[-5:]) if len(ydata) >= 5 else ydata[-1]
-            total_drop = ydata[0] - tail_floor
-            if total_drop > 0:
-                clean_transient_mask = ydata >= (tail_floor + 0.15 * total_drop)
-                xdata = xdata[clean_transient_mask]
-                ydata = ydata[clean_transient_mask]
-            xdata = xdata - xdata[0] # Re-zero timeline for clean exponential evaluation
+            if (max_idx := np.argmax(ydata)) > 0:
+                xdata, ydata = xdata[max_idx:], ydata[max_idx:]
+            if (drop := ydata[0] - (np.mean(ydata[-5:]) if len(ydata) >= 5 else ydata[-1])) > 0:
+                mask = ydata >= (ydata[-1] + 0.15 * drop)
+                xdata, ydata = xdata[mask], ydata[mask]
+                
+            xdata -= xdata[0]
             scale_x, scale_y = self.scale_factor(model, xdata, ydata)
-            self.function = FurmanNoPhotoFit.FURMAN_DECAY
+            self.function = self.FURMAN_DECAY
             self._compiled_fn = compile(self.function, f"<{self.name}_fitfn>", "eval")
+            self.fix({"y0": ydata[0] * scale_y})
             
-            y0_scaled = ydata[0] * scale_y
-            self.fix({"y0": y0_scaled})
-            if len(xdata) > 1 and ydata[1] > 0 and ydata[0] > 0:
-                dx = (xdata[1] - xdata[0]) * scale_x
-                gamma_est = (np.log(ydata[1]) - np.log(ydata[0])) / (dx if dx != 0 else 1e-12)
-            else:
-                gamma_est = -0.1
-            if gamma_est >= 0: 
-                gamma_est = -0.1
-            beta_init = 1.0 
-            yc_init = gamma_est / beta_init
-            bounds = {
-                "yc": (-np.inf, -1e-12),  # Strictly negative parameter boundary
-                "beta": (1e-6, np.inf)    # Retains positive interpretation continuity
-            }
-            self.initial({
-                "yc": yc_init,
-                "beta": beta_init
-            })
-        self.bound(bounds)
+            dx = (xdata[1] - xdata[0]) * scale_x if len(xdata) > 1 else 1.0
+            gamma_est = (np.log(ydata[1]) - np.log(ydata[0])) / dx if len(xdata) > 1 and ydata[1] > 0 and ydata[0] > 0 else -0.1
+            if gamma_est >= 0: gamma_est = -0.1
+            
+            self.bound({"yc": (-np.inf, -1e-12), "beta": (1e-6, np.inf)})
+            self.initial({"yc": gamma_est, "beta": 1.0})
+            
         return super().fit(model, refit, xdata, ydata)
 
 
 class FurmanNPMCFit(FurmanBaseFit):
-    """
-    "FURMAN" NO PHOTOEMISSION MODEL WITH MAGNETIC CORRECTION
-    """
+    """No Photoemission variant corrected for background magnetic multi-pole boundaries."""
     FURMAN_NO_PHOTO_MC = "(y0 * yc * np.exp(yc*x*(b0 + 0.5*b1*x))) / (yc + y0 * (np.exp(yc*x*(b0 + 0.5*b1*x)) - 1))"
 
     def __init__(self, db: SimDB, selector: None | DataSelector = None):
         self.db = db
-        super().__init__(
-            "furman_npmc",
-            FurmanNPMCFit.FURMAN_NO_PHOTO_MC,
-            ("x", "yc", "b0", "b1", "y0"),
-            BunchAverageSelector() if selector is None else selector
-        )
+        super().__init__("furman_npmc", self.FURMAN_NO_PHOTO_MC, ("x", "yc", "b0", "b1", "y0"), BunchAverageSelector() if selector is None else selector)
     
     def fit(self, model: ECModel, refit: bool = False, xdata: np.ndarray | None = None, ydata: np.ndarray | None = None) -> np.ndarray | None:
-        # Composition: Bootstrapping baseline parameters from standard NoPhoto fit execution
-        np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
-        if np_result is None:
+        if FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit) is None:
             self._mset("success", False, model)
             setattr(model, f"_{self.name}_fitting_error", "The underlying NoPhoto fit failed.")
             return None
@@ -1536,38 +1509,22 @@ class FurmanNPMCFit(FurmanBaseFit):
             self.initial({"b0": model.furman_np_beta})
         else:
             self.fix({"y0": model.furman_np_y0, "yc": model.furman_np_yc})
-            base_search = self.db.where(doc_id=model.doc_id)[0]
-            base_model = self.db.closest(base_search, photoemission=False, furman_np_success=True, B_multip=[0])
+            base_model = self.db.closest(self.db.where(doc_id=model.doc_id)[0], photoemission=False, furman_np_success=True, B_multip=[0])
+            base_beta = ECModel(model.db, base_model[0]).furman_np_beta if base_model else (model.furman_np_beta / 2)
+            base_beta = base_beta if base_beta > 0 else (model.furman_np_beta / 2)
             
-            if len(base_model) != 0:
-                base_model = ECModel(model.db, base_model[0])
-                base_beta = base_model.furman_np_beta if base_model.furman_np_beta > 0 else (model.furman_np_beta / 2)
-                self.initial({"b0": base_beta, "b1": 0})
-                self.bound({"b0": (0, 2 * base_beta), "b1": (-base_beta, base_beta)})
-            else:
-                self.initial({"b0": 0.1, "b1": 0})
-                self.bound({"b0": (0, np.inf), "b1": (-np.inf, np.inf)})
+            self.initial({"b0": base_beta, "b1": 0})
+            self.bound({"b0": (0, 2 * base_beta), "b1": (-base_beta, base_beta)})
                 
         return super().fit(model, refit, xdata, ydata)
 
+
 class FurmanPhotoFit(FurmanBaseFit):
-    """
-    "FURMAN" FULL MODEL (B) - WITH PHOTOEMISSION
-    
-    Optimized via a stable asymptotic lift reparameterization (delta = y_inf - yc)
-    to prevent ill-conditioned Jacobians and convergence failures when photoemission
-    is weak or negligible. Fully backward-compatible with the standard parameter space.
-    """
-    # Textbook formula for reporting and fit_function evaluation
+    """Full Model optimized via stable delta reparameterization to accommodate active photoemission."""
     FURMAN_PHOTO_READABLE = """0.5*(yc + np.sqrt(yc**2 + (4*alpha/beta))*np.tanh((x/2)*np.sqrt(beta*(4*alpha + (yc**2)*beta)) - np.arctanh((yc - 2*y0)*np.sqrt(beta / (4*alpha + (yc**2)*beta)))))"""
 
     def __init__(self, selector: None | DataSelector = None):
-        super().__init__(
-            "furman_p",
-            FurmanPhotoFit.FURMAN_PHOTO_READABLE,
-            ("x", "yc", "alpha", "beta", "y0"),
-            BunchAverageSelector() if selector is None else selector
-        )
+        super().__init__("furman_p", self.FURMAN_PHOTO_READABLE, ("x", "yc", "alpha", "beta", "y0"), BunchAverageSelector() if selector is None else selector)
     
     def fit(self, model, refit: bool = False, xdata: np.ndarray | None = None, ydata: np.ndarray | None = None) -> np.ndarray | None:
         if not model.buildup:
@@ -1578,120 +1535,101 @@ class FurmanPhotoFit(FurmanBaseFit):
         if not refit and self._mget("success", model):
             return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
 
-        # --- IDEAS 2 & 3: Handle Zero Photoemission immediately to prevent parameter competition ---
         if getattr(model, "k_pe_st", 0.0) <= 0:
-            np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
-            if np_result is None:
-                self._mset("success", False, model)
-                setattr(model, f"_{self.name}_fitting_error", "Zero-photoemission NoPhoto fallback failed.")
+            if (np_result := FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)) is None:
+                self._mset("success", False, model); setattr(model, f"_{self.name}_fitting_error", "Zero-photoemission NoPhoto fallback failed.")
                 return None
-            
-            # Map No-Photo results (yc, beta, y0) directly and set alpha strictly to 0
             for i, var in enumerate(["yc", "beta", "y0"]):
-                self._mset(var, np_result[0, i], model)
-                self._mset(var+"_err", np_result[1, i], model)
-                
-            self._mset("alpha", 0.0, model)
-            self._mset("alpha_err", 0.0, model)
-            self._mset("success", True, model)
+                self._mset(var, np_result[0, i], model); self._mset(var+"_err", np_result[1, i], model)
+            self._mset("alpha", 0.0, model); self._mset("alpha_err", 0.0, model); self._mset("success", True, model)
             return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
 
         try:
-            xdata, ydata = self.select_data(model)
+            if xdata is None or ydata is None: xdata, ydata = self.select_data(model)
             scale_x, scale_y = self.scale_factor(model, xdata, ydata)
-            
             X, Y = xdata * scale_x, ydata * scale_y
-            y0_val = Y[0]
             
-            # --- Step 1: Bootstrapping Baseline from No-Photo Model ---
-            np_result = FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)
-            if np_result is None:
-                self._mset("success", False, model)
-                setattr(model, f"_{self.name}_fitting_error", "The underlying NoPhoto fit failed.")
+            if (np_result := FurmanNoPhotoFit(selector=self.selector).fit(model, refit=refit)) is None:
+                self._mset("success", False, model); setattr(model, f"_{self.name}_fitting_error", "The underlying NoPhoto fit failed.")
                 return None
                 
-            yc_baseline = np_result[0, 0] # Index 0,0 corresponds to the value of yc
-            
-            # --- Step 2: Intelligent Initial Guessing via Growth Partitioning ---
-            dX = np.diff(X)
-            dY = np.diff(Y)
-            dYdX = dY / np.where(dX == 0, 1e-12, dX)
-            
-            # Partition initial steepness (alpha) vs max avalanche steepness (beta)
+            dYdX = np.diff(Y) / np.where(np.diff(X) == 0, 1e-12, np.diff(X))
             m0 = max(np.mean(dYdX[:max(1, len(dYdX)//20)]), 1e-12)
-            m_max = max(np.max(dYdX), m0 * 1.1)
             
-            yc_init = max(yc_baseline, np.max(Y) * 1.05)
-            
-            # Alpha is bounded physically by the initial slope
-            alpha_init = min(model.k_pe_st * scipy.constants.c * model.b_spac * 0.1, m0)
-            alpha_init = max(alpha_init, 1e-8)
-            
-            # Beta drives the rest of the peak steepness
-            beta_init = max(4.0 * (m_max - alpha_init) / (yc_init**2), 1e-8)
+            yc_init = max(np_result[0, 0], self.limit_estimate(xdata, ydata) * scale_y)
+            alpha_init = max(min(model.k_pe_st * scipy.constants.c * model.b_spac * 0.1, m0), 1e-8)
+            beta_init = max(4.0 * (np.max(dYdX) - alpha_init) / (yc_init**2), 1e-8)
+            delta_p0 = max(0.5 * (-yc_init + np.sqrt(yc_init**2 + 4.0 * alpha_init / beta_init)), 1e-8)
 
-            delta_p0 = 0.5 * (-yc_init + np.sqrt(yc_init**2 + 4.0 * alpha_init / beta_init))
-            delta_p0 = max(delta_p0, 1e-8)
-
-            # --- Step 3: Define the Reparameterized Target Function ---
             def stable_delta_target(x, yc, delta, beta):
                 D = yc + 2.0 * delta
-                y_inf = yc + delta
-                y_neg = -delta
                 E = np.exp(-beta * D * x)
-                denom = (y0_val - y_neg) + (y_inf - y0_val) * E
-                return (y_inf * (y0_val - y_neg) + y_neg * (y_inf - y0_val) * E) / np.where(denom == 0, 1e-12, denom)
-
-            # --- Step 4: Execute Optimization (x_scale='jac' automatically applies via Fit.fit kwargs) ---
-            p0 = [yc_init, delta_p0, beta_init]
-            bounds_lower = [y0_val, 0.0, 0.0]
-            bounds_upper = [
-                max(yc_init * 3.0, np.max(Y) * 5.0), 
-                max(np.max(Y) * 5.0, 10.0), 
-                max(beta_init * 10.0, 10.0)
-            ]
+                denom = (Y[0] + delta) + (yc + delta - Y[0]) * E
+                return ((yc + delta) * (Y[0] + delta) + (-delta) * (yc + delta - Y[0]) * E) / np.where(denom == 0, 1e-12, denom)
 
             result, covariance = scipy.optimize.curve_fit(
-                stable_delta_target, X, Y, p0=p0,
-                bounds=(bounds_lower, bounds_upper),
-                loss="arctan", maxfev=int(1e5), nan_policy="omit",
-                ftol=1e-12, xtol=1e-12, x_scale="jac"
+                stable_delta_target, X, Y, p0=[yc_init, delta_p0, beta_init],
+                bounds=([Y[0], 1e-8, 0.0], [yc_init * 1.1, max(np.max(Y) * 5.0, 10.0), max(beta_init * 10.0, 10.0)]),
+                loss="arctan", maxfev=int(1e5), nan_policy="omit", ftol=1e-12, xtol=1e-12, x_scale="jac"
             )
             
             yc_fit, delta_fit, beta_fit = result
-            perr = np.sqrt(np.diag(covariance))
-            yc_err, delta_err, beta_err = perr
+            yc_err, delta_err, beta_err = np.sqrt(np.diag(covariance))
             
-            # --- Step 5: Map Back to Physical Alpha with Complete Covariance Tracking ---
             alpha_fit = beta_fit * (yc_fit + delta_fit) * delta_fit
-            
-            d_alpha_d_yc = beta_fit * delta_fit
-            d_alpha_d_delta = beta_fit * (yc_fit + 2.0 * delta_fit)
-            d_alpha_d_beta = (yc_fit + delta_fit) * delta_fit
-            
-            jacobian = np.array([d_alpha_d_yc, d_alpha_d_delta, d_alpha_d_beta])
-            alpha_var = jacobian @ covariance @ jacobian.T
-            alpha_err = np.sqrt(max(alpha_var, 0.0))
+            jacobian = np.array([beta_fit * delta_fit, beta_fit * (yc_fit + 2.0 * delta_fit), (yc_fit + delta_fit) * delta_fit])
+            alpha_err = np.sqrt(max(jacobian @ covariance @ jacobian.T, 0.0))
 
-            # --- Step 6: Sync back to standard model attributes ---
             self._mset("yc", yc_fit, model); self._mset("yc_err", yc_err, model)
             self._mset("alpha", alpha_fit, model); self._mset("alpha_err", alpha_err, model)
             self._mset("beta", beta_fit, model); self._mset("beta_err", beta_err, model)
-            self._mset("y0", y0_val, model); self._mset("y0_err", 0, model)
-            
+            self._mset("y0", Y[0], model); self._mset("y0_err", 0, model)
             self._mset("success", True, model)
             self._mset("train", getattr(self.selector, 'use_train', True), model)
             
             for attr in ["_data", "_smooth", "_smooth_diff"]:
                 if hasattr(model, attr): delattr(model, attr)
-                
         except (RuntimeError, ValueError) as e:
-            self._mset("success", False, model)
-            setattr(model, f"_{self.name}_fitting_error", str(e))
+            self._mset("success", False, model); setattr(model, f"_{self.name}_fitting_error", str(e))
             return None
             
         self._reset_state()
         return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
+
+
+class PhotoGammaFit(FurmanBaseFit):
+    """
+    Furman-like photoemission fit with different structure.
+
+    """
+    PHOTO_GAMMA = """(yc/2) + gamma*(( (2*gamma - yc + 2*y0)*np.exp(2*beta*gamma*x) - 1) / ( (2*gamma - yc + 2*y0)*np.exp(2*beta*gamma*x) + 1 ))"""
+
+    def __init__(self, selector: None | DataSelector = None):
+        super().__init__(
+            "pgfit",
+            PhotoGammaFit.PHOTO_GAMMA,
+            ("x", "yc", "beta", "gamma", "y0"),
+            BunchAverageSelector() if selector is None else selector
+        )
+    
+    def fit(self, model, refit: bool = False, xdata: np.ndarray | None = None, ydata: np.ndarray | None = None) -> np.ndarray | None:
+        if not refit and self._mget("success", model):
+            return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
+
+        if xdata is None or ydata is None:
+            xdata, ydata = self.select_data(model)
+        scale_x, scale_y = self.scale_factor(model, xdata, ydata)
+        self.fix({"y0": ydata[0] * scale_y})
+        bounds = {
+            "yc": (ydata[0] * scale_y, np.inf),
+            "beta": (-np.inf, np.inf),
+            "gamma": (0, np.inf)
+        }
+        self.initial({
+            "yc": ydata[-1] * scale_y,
+            "beta": 1.0 if model.buildup else -1.0,
+            "gamma": 0
+        })
 
 
 def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True, **search):
