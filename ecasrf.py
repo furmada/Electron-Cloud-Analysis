@@ -138,7 +138,7 @@ def _max_inscribed_ellipse(X: np.ndarray, Y: np.ndarray) -> tuple[np.number, np.
     a, b = result.x * (1 - 100*np.sum(np.maximum(1.0 - (points[:, 0]**2 / result.x[0]**2 + points[:, 1]**2 / result.x[1]**2), 0.0)))
     return a, b
 
-def make_matfiles(Z: float, zslice: np.ndarray, output_dir: str = "output", k_pe_sts: Iterable[float] = [1e-6, 1e-5, 1e-4, 1e-3]) -> tuple[list[str], list[str]]:
+def make_matfiles(Z: float, zslice: np.ndarray, dZ: float = 1.0, output_dir: str = "output", k_pe_sts: Iterable[float] = [1e-6, 1e-5, 1e-4, 1e-3]) -> tuple[list[str], list[str]]:
     """
     Take the "zslice" containing points (X, Y, Flux) - the output of slice_flux_data, and output the PyECLOUD .mat files.
     """
@@ -146,7 +146,7 @@ def make_matfiles(Z: float, zslice: np.ndarray, output_dir: str = "output", k_pe
     # Compute the segment lengths
     seg_len: Unknown = np.sqrt(np.diff(x_b, append=x_b[0])**2 + np.diff(y_b, append=y_b[0])**2)
     # Total Flux
-    total_flux = float(np.sum(f_b * seg_len))
+    total_flux = float(np.sum(f_b * seg_len) * dZ)
     # Compute the length-weighted flux distribution
     cumdist = np.cumsum((f_b * seg_len) / (np.sum(f_b * seg_len)))
     # Fit ellipse

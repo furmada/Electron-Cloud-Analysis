@@ -742,12 +742,24 @@ class ECModel(SynchedEntry):
             train = len(self.train_times) + train
         return np.arange(int(self.time_to_index(self.train_times[train])), int(self.time_to_index(self.train_times[train+1]) if train < len(self.train_times) - 1 else self.cutoff))
 
-    def train_to_bunches(self, train: int | np.integer) -> np.ndarray:
+    def train_to_bunches(self, train: int) -> np.ndarray:
         """
-        Convert a train number to its corresponding bunch passage indexes.
+        Returns indices of bunches belonging to a specific train.
+        Handles non-uniform bunch spacing by using time-windows.
         """
-        train_lengths = np.diff(self.train_times, append=self.time[self.cutoff])
-        return np.argwhere(np.bitwise_and(self.bunch_times >= self.train_times[train], self.bunch_times < self.train_times[train] + train_lengths[train])).ravel().astype(int)
+        if len(self.train_times) == 0:
+            return np.array([], dtype=int)
+        
+        # Handle negative indexing
+        if train < 0:
+            train = len(self.train_times) + train
+            
+        start_t = self.train_times[train]
+        # End of this train is the start of the next, or the end of the simulation
+        end_t = self.train_times[train+1] if (train + 1) < len(self.train_times) else self.time[self.cutoff]
+        
+        # Filter bunch_times that fall within this specific window
+        return np.where((self.bunch_times >= start_t) & (self.bunch_times < end_t))[0]
 
     def gen_area(self):
         """
@@ -838,16 +850,41 @@ class ECModel(SynchedEntry):
 
     def gen_train_times(self):
         """
-        The times of each bunch train.
+        Detects train starts by comparing total simulation time to pattern duration
+        and identifying periodic repetitions in the filling pattern.
         """
-        gap_lens = unique_with_tolerance(np.diff(self.bunch_times, prepend=self.t_offs), self.t_offs)
-        if len(np.where(gap_lens > self.t_offs)[0]) > 2:
-            # We actually have trains
-            where_gaps = np.argwhere(np.diff(self.bunch_times, prepend=self.t_offs) > np.max(gap_lens) - self.t_offs).ravel()
-            self.train_times = np.concatenate((np.array([self.bunch_times[0]]), self.bunch_times[where_gaps]), axis=None)
-        else:
-            # No trains
-            self.train_times = np.array([self.bunch_times[0]])
+        # 1. Physical Check: Do we even have enough time for multiple trains?
+        # Total pattern duration = number of slots * bunch spacing
+        pattern_duration = len(self.filling_pattern_file) * self.b_spac
+        sim_duration = self.time[-1] - self.time[0]
+
+        # If simulation is shorter than one pattern length, it's a single train
+        if sim_duration <= 1.8 * pattern_duration:
+            # Use the first filled bunch as the start
+            filled_indices = np.where(self.filling_pattern_file == 1)[0]
+            if len(filled_indices) > 0:
+                self.train_times = np.array([self.t_offs + (filled_indices[0] * self.b_spac)])
+            else:
+                self.train_times = np.array([])
+            return
+
+        # 2. Multi-Train Logic: Segment by pattern repetitions
+        # Identify which bunches (by index) are filled
+        filled_slots = np.where(self.filling_pattern_file == 1)[0]
+        if len(filled_slots) == 0:
+            self.train_times = np.array([])
+            return
+
+        # The first train starts at the first filled slot
+        first_train_start = self.t_offs + (filled_slots[0] * self.b_spac)
+        
+        # Calculate starts for subsequent trains based on pattern duration
+        # We find how many repetitions occur in the total time
+        num_repetitions = int(np.ceil(sim_duration / pattern_duration))
+        self.train_times = np.array([
+            first_train_start + (i * pattern_duration) 
+            for i in range(num_repetitions)
+        ])
 
 class InstabilityModel(SynchedEntry):
     """
@@ -1206,24 +1243,61 @@ class DataSelector(object):
         self.use_central_density = use_central_density
         self.use_train = use_train
 
-    def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        train = model.train_to_index(self.use_train)
-        return (model.time[train], model.central_density[train] if self.use_central_density else model.N_electrons[train])
+    def select(self, model: "ECModel") -> tuple[np.ndarray, np.ndarray]:
+        try:
+            train = model.train_to_index(self.use_train)
+            if len(train) == 0:
+                return np.array([]), np.array([])
+            
+            y_src = model.central_density if self.use_central_density else model.N_electrons
+            return (model.time[train], y_src[train])
+        except (IndexError, ValueError):
+            return np.array([]), np.array([])
+
 
 class BeforeBunchSelector(DataSelector):
     """Selects the points immediately before each bunch passage as the fitting points."""
-    def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
-        idx = np.array(model.time_to_index(model.bunch_times[model.train_to_bunches(self.use_train)] - model.half_bunch))
-        return (model.time[idx] - model.time[idx[0]], (model.central_density if self.use_central_density else model.N_electrons)[idx])
+    def select(self, model: "ECModel") -> tuple[np.ndarray, np.ndarray]:
+        valid = model.train_to_bunches(self.use_train)
+        if len(valid) == 0:
+            return np.array([]), np.array([])
+            
+        # Find index right before each bunch passes
+        idx = model.time_to_index(model.bunch_times[valid] - model.half_bunch)
+        idx = np.clip(idx, 0, model.time.size - 1)
+        
+        y_src = model.central_density if self.use_central_density else model.N_electrons
+        return (model.time[idx] - model.time[idx[0]], y_src[idx])
+
 
 class BunchAverageSelector(DataSelector):
-    """Selects the average points within the bunch step spacing interval."""
-    def select(self, model: ECModel) -> tuple[np.ndarray, np.ndarray]:
+    """Selects the average data points within each bunch interval, robust against non-uniform layouts."""
+    def select(self, model: "ECModel") -> tuple[np.ndarray, np.ndarray]:
         valid = model.train_to_bunches(self.use_train)
-        idx = np.array(model.time_to_index(model.bunch_times[valid] - model.half_bunch))
+        if len(valid) == 0:
+            return np.array([]), np.array([])
+
         y_src = model.central_density if self.use_central_density else model.N_electrons
-        t = (model.bunch_times - model.half_bunch + (model.b_spac / 2))[valid]
-        return (t - t[0], np.array([np.mean(y_src[s : s + model.bunch_step]) for s in idx]))
+        
+        # Convert absolute timestamps to raw array start indices
+        starts = np.clip(model.time_to_index(model.bunch_times[valid] - model.half_bunch), 0, y_src.size - 1)
+        
+        # Non-Uniform Protection: Compute safe window lengths
+        # If the next bunch arrives early, shrink the window to match the actual distance.
+        max_step = model.bunch_step
+        if len(starts) > 1:
+            distances = np.diff(starts)
+            steps = np.append(np.minimum(max_step, distances), max_step)
+        else:
+            steps = np.array([max_step])
+            
+        ends = np.clip(starts + steps, 0, y_src.size)
+
+        # Calculate exact average time coordinates and values per slice
+        t_out = np.array([np.mean(model.time[s:e]) for s, e in zip(starts, ends)])
+        y_out = np.array([np.mean(y_src[s:e]) for s, e in zip(starts, ends)])
+
+        return (t_out - t_out[0], y_out)
 
 class MaskDataSelector(DataSelector):
     """Wraps an existing selector and applies a custom mask array."""
@@ -1541,6 +1615,7 @@ class FurmanPhotoFit(FurmanBaseFit):
                 return None
             for i, var in enumerate(["yc", "beta", "y0"]):
                 self._mset(var, np_result[0, i], model); self._mset(var+"_err", np_result[1, i], model)
+            self._mset("scale_x", model.furman_np_scale_x, model); self._mset("scale_y", model.furman_np_scale_y, model)
             self._mset("alpha", 0.0, model); self._mset("alpha_err", 0.0, model); self._mset("success", True, model)
             return np.array([(self._mget(v, model), self._mget(v+"_err", model)) for v in self.variables[1:]]).T
 
@@ -1648,8 +1723,9 @@ def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True
             if isinstance(db.db.storage, CachingMiddleware):
                 db.db.storage.flush()
             if verbose: print("{:<3}/{} {}".format(i, len(results), "S" if fit._mget("success", model) else "F"), end="\r")
-        except:
-            if verbose: print("Exceptional error in fit. A file may be missing.")
+        except Exception as e:
+            if verbose:
+                print(f"Exceptional error in fit of doc_id {model.doc_id}. A file may be missing:", e)
     if verbose: print("Done.        ")
 
 if __name__ == "__main__":
