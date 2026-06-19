@@ -1,13 +1,9 @@
-from . import fit
-from . import instability
-from . import run
-from . import plots
-from . import synrad
-
+import os
 from shutil import copy2
 from itertools import product
 import numpy as np
 from scipy.io import loadmat
+from typing import Iterable, Callable
 
 from tinydb import JSONStorage, TinyDB, Query
 from tinydb.storages import MemoryStorage, JSONStorage

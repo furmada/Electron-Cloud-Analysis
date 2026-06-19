@@ -12,35 +12,39 @@ import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from typing import Optional, List, Dict, Any, Callable
 import numpy as np
-from collections import defaultdict
 
 try:
-    from eca import SimDB, ECModel, InstabilityModel, FurmanNoPhotoFit, FurmanPhotoFit, FurmanNPMCFit, Fit, WhereIn, BeforeBunchSelector, BunchAverageSelector
-    from ecaplots import model_plot, versus_plot, histogram_plot
+    from eca import SimDB, ECModel, WhereIn
+    from eca.fit import  FurmanNoPhotoFit, FurmanPhotoFit, FurmanNPMCFit, BeforeBunchSelector, BunchAverageSelector
+    from eca.plots import model_plot, versus_plot, histogram_plot
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
 except ImportError as e:
     print(f"Error importing ECA modules: {e}")
-    print("Make sure eca.py and ecaplots.py are in the same directory or PYTHONPATH")
+    print("Make sure eca package is properly installed")
     sys.exit(1)
 
 
 class FilterDefinition:
     """Serializable filter definition for copy-paste support."""
     
+    EXACT = "exact"
+    CONDITION = "condition"
+    EXPRESSION = "expression"
+    
     @staticmethod
     def to_dict(filter_obj: Dict[str, Any]) -> Dict[str, Any]:
         """Convert filter object to serializable dictionary."""
         result = {"type": filter_obj["type"]}
         
-        if filter_obj["type"] == "exact":
+        if filter_obj["type"] == FilterDefinition.EXACT:
             result["property"] = filter_obj["property"]
             result["values"] = [
                 str(v) if isinstance(v, (list, np.ndarray)) else v 
                 for v in filter_obj["values"]
             ]
-        elif filter_obj["type"] == "condition":
+        elif filter_obj["type"] == FilterDefinition.CONDITION:
             result["property"] = filter_obj["property"]
             result["operator"] = filter_obj["operator"]
             result["value"] = filter_obj["value"]
@@ -52,22 +56,22 @@ class FilterDefinition:
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> Dict[str, Any]:
         """Reconstruct filter object from serialized dictionary."""
-        if data["type"] == "exact":
+        if data["type"] == FilterDefinition.EXACT:
             return {
-                "type": "exact",
+                "type": FilterDefinition.EXACT,
                 "property": data["property"],
                 "values": data["values"]
             }
-        elif data["type"] == "condition":
+        elif data["type"] == FilterDefinition.CONDITION:
             return {
-                "type": "condition",
+                "type": FilterDefinition.CONDITION,
                 "property": data["property"],
                 "operator": data["operator"],
                 "value": data["value"]
             }
         else:  # expression
             return {
-                "type": "expression",
+                "type": FilterDefinition.EXPRESSION,
                 "expr": data["expr"]
             }
     
@@ -91,16 +95,23 @@ class FilterDefinition:
 class ECAApp:
     """Main application class for the Electron Cloud Analysis GUI."""
     
-    FIT_MODELS = {"FurmanNoPhoto": FurmanNoPhotoFit, "FurmanNPMC": FurmanNPMCFit, "FurmanPhoto": FurmanPhotoFit}
+    FIT_MODELS = {
+        "FurmanNoPhoto": FurmanNoPhotoFit,
+        "FurmanNPMC": FurmanNPMCFit,
+        "FurmanPhoto": FurmanPhotoFit
+    }
     
     def __init__(self, root: tk.Tk, db: Optional[SimDB] = None, is_temp: bool = False, db_file: Optional[str] = None):
         self.root = root
         self.is_temp = is_temp
         self.db: Optional[SimDB] = db
         self.search_criteria: Dict[str, Any] = {}
-        self.current_models: List[ECModel] = []
         self.filter_val_map = {}
         self.individual_columns = ["doc_id"]
+        
+        # Track individual plot state
+        self._last_doc_id = None
+        self._last_fits = None
         
         self._setup_window()
         self._setup_fonts()
@@ -226,10 +237,8 @@ class ECAApp:
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
         )
         
-        if not filename:
-            return
-        
-        self._load_database_from_file(filename)
+        if filename:
+            self._load_database_from_file(filename)
 
     def _load_database_from_file(self, filename: str):
         """Load a database from the specified file path."""
@@ -405,9 +414,14 @@ class ECAApp:
         mode_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         
         ttk.Label(mode_frame, text="Filter Mode:").pack(side=tk.LEFT, padx=(0, 10))
-        self.filter_mode_var = tk.StringVar(value="exact")
-        for mode, label in [("exact", "Exact Match"), ("condition", "Condition (>, <, ==)"), ("expression", "Custom Expression")]:
-            ttk.Radiobutton(mode_frame, text=label, variable=self.filter_mode_var, value=mode, command=self._toggle_filter_mode).pack(side=tk.LEFT, padx=5)
+        self.filter_mode_var = tk.StringVar(value=FilterDefinition.EXACT)
+        for mode, label in [
+            (FilterDefinition.EXACT, "Exact Match"),
+            (FilterDefinition.CONDITION, "Condition (>, <, ==)"),
+            (FilterDefinition.EXPRESSION, "Custom Expression")
+        ]:
+            ttk.Radiobutton(mode_frame, text=label, variable=self.filter_mode_var, 
+                           value=mode, command=self._toggle_filter_mode).pack(side=tk.LEFT, padx=5)
         
         control_frame = ttk.LabelFrame(tab, text="Filter Criteria", padding="5")
         control_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -417,7 +431,8 @@ class ECAApp:
         self.prop_frame.pack(fill=tk.X, pady=5)
         ttk.Label(self.prop_frame, text="Property:").pack(side=tk.LEFT)
         self.filter_property_var = tk.StringVar()
-        self.filter_property_combo = ttk.Combobox(self.prop_frame, textvariable=self.filter_property_var, state="readonly", width=30)
+        self.filter_property_combo = ttk.Combobox(self.prop_frame, textvariable=self.filter_property_var, 
+                                                   state="readonly", width=30)
         self.filter_property_combo.pack(side=tk.LEFT, padx=5)
         self.filter_property_combo.bind("<<ComboboxSelected>>", self._on_property_select)
         
@@ -458,8 +473,6 @@ class ECAApp:
         
         self.active_filters_text = scrolledtext.ScrolledText(filters_frame, height=8, wrap=tk.WORD, font=("TkFixedFont", 9))
         self.active_filters_text.pack(fill=tk.BOTH, expand=True)
-        
-        # Add context menu for copy/paste
         self.active_filters_text.bind("<Button-3>", self._show_filter_context_menu)
         
         button_frame = ttk.Frame(tab)
@@ -478,10 +491,10 @@ class ECAApp:
         self.condition_frame.pack_forget()
         self.expression_frame.pack_forget()
         
-        if mode == "exact":
+        if mode == FilterDefinition.EXACT:
             self.prop_frame.pack(fill=tk.X, pady=5, before=self.input_container)
             self.exact_frame.pack(fill=tk.X)
-        elif mode == "condition":
+        elif mode == FilterDefinition.CONDITION:
             self.prop_frame.pack(fill=tk.X, pady=5, before=self.input_container)
             self.condition_frame.pack(fill=tk.X)
         else:  # expression
@@ -517,9 +530,9 @@ class ECAApp:
         try:
             new_filter = None
             
-            if mode == "exact":
+            if mode == FilterDefinition.EXACT:
                 new_filter = self._create_exact_filter()
-            elif mode == "condition":
+            elif mode == FilterDefinition.CONDITION:
                 new_filter = self._create_condition_filter()
             else:  # expression
                 new_filter = self._create_expression_filter()
@@ -542,7 +555,7 @@ class ECAApp:
         selected_strings = [self.filter_values_listbox.get(i) for i in selected_indices]
         exact_values = [self.filter_val_map[val_str] for val_str in selected_strings]
         
-        return {"type": "exact", "property": prop, "values": exact_values}
+        return {"type": FilterDefinition.EXACT, "property": prop, "values": exact_values}
 
     def _create_condition_filter(self) -> Optional[Dict[str, Any]]:
         """Create condition filter object."""
@@ -562,7 +575,7 @@ class ECAApp:
             val = val_str
         
         op = self.cond_op_var.get()
-        return {"type": "condition", "property": prop, "operator": op, "value": val}
+        return {"type": FilterDefinition.CONDITION, "property": prop, "operator": op, "value": val}
 
     def _create_expression_filter(self) -> Optional[Dict[str, Any]]:
         """Create expression filter object."""
@@ -570,7 +583,7 @@ class ECAApp:
         if not expr:
             raise ValueError("Please enter an expression")
         
-        return {"type": "expression", "expr": expr}
+        return {"type": FilterDefinition.EXPRESSION, "expr": expr}
 
     def _add_filter_to_json(self, new_filter: Dict[str, Any]):
         """Add a new filter to the JSON text in the textbox."""
@@ -617,7 +630,6 @@ class ECAApp:
             clipboard_data = self.root.clipboard_get()
             new_filters = FilterDefinition.deserialize_all(clipboard_data)
             
-            # Get current filters from JSON text
             current_text = self.active_filters_text.get(1.0, tk.END).strip()
             try:
                 if current_text and current_text != "[]":
@@ -662,9 +674,9 @@ class ECAApp:
             return False
         
         for i, f_data in enumerate(filters):
-            if f_data["type"] == "exact":
+            if f_data["type"] == FilterDefinition.EXACT:
                 self.search_criteria[f_data["property"]] = WhereIn(*f_data["values"])
-            elif f_data["type"] == "condition":
+            elif f_data["type"] == FilterDefinition.CONDITION:
                 self.search_criteria[f"_cond_{i}"] = self._make_condition(f_data["property"], f_data["operator"], f_data["value"])
             else:  # expression
                 self.search_criteria[f"_expr_{i}"] = f_data["expr"]
@@ -712,13 +724,12 @@ class ECAApp:
                 return
             
             filtered_sims = self.db.where(**self.search_criteria)
-            self.current_models = [ECModel(self.db.db, doc) for doc in filtered_sims]
             
             self._update_overview_tab()
             self._update_individual_sim_list()
             
-            self._update_status(f"Filter applied: {len(self.current_models)} simulations match.")
-            messagebox.showinfo("Success", f"Filter applied successfully. {len(self.current_models)} simulations match.")
+            self._update_status(f"Filter applied: {len(filtered_sims)} simulations match.")
+            messagebox.showinfo("Success", f"Filter applied successfully. {len(filtered_sims)} simulations match.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to apply filter: {str(e)}")
 
@@ -735,7 +746,6 @@ class ECAApp:
         
         self._clear_filters()
         self.search_criteria = {}
-        self.current_models = [ECModel(self.db.db, doc) for doc in self.db.db.all()]
         self._update_overview_tab()
         self._update_individual_sim_list()
         self._update_status("Database reset to full dataset.")
@@ -743,13 +753,13 @@ class ECAApp:
 
     def _open_temp_window(self):
         """Open a new GUI window with currently filtered results."""
-        if not self.current_models:
-            messagebox.showwarning("Warning", "No simulations to display in a new window.")
+        if not self.search_criteria:
+            messagebox.showwarning("Warning", "Please apply filters first before opening a temporary window.")
             return
         
         new_window = tk.Toplevel(self.root)
         new_app = ECAApp(new_window, db=self.db, is_temp=True)
-        new_app.current_models = self.current_models.copy()
+        new_app.search_criteria = self.search_criteria.copy()
         new_app._update_overview_tab()
         new_app._update_individual_sim_list()
 
@@ -981,7 +991,7 @@ class ECAApp:
         return plotable_props
 
     def _generate_plot(self):
-        """Generate a plot using ecaplots.versus_plot."""
+        """Generate a plot using eca.plots.versus_plot."""
         if not self.db:
             messagebox.showwarning("Warning", "No database loaded")
             return
@@ -1044,7 +1054,7 @@ class ECAApp:
         NavigationToolbar2Tk(self.hist_canvas, plot_frame).update()
 
     def _generate_histogram(self):
-        """Generate a histogram using ecaplots.histogram_plot."""
+        """Generate a histogram using eca.plots.histogram_plot."""
         if not self.db:
             messagebox.showwarning("Warning", "No database loaded")
             return
@@ -1121,16 +1131,18 @@ class ECAApp:
         for fit_name in self.FIT_MODELS.keys():
             var = tk.BooleanVar(value=False)
             self.individual_fit_vars[fit_name] = var
-            # Bind the checkbutton to immediately redraw the plot
-            ttk.Checkbutton(fit_frame, text=fit_name, variable=var, command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=5)
+            ttk.Checkbutton(fit_frame, text=fit_name, variable=var, 
+                           command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=5)
         
         self.individual_central_density_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fit_frame, text="Use Central Density", variable=self.individual_central_density_var, command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=10)
+        ttk.Checkbutton(fit_frame, text="Use Central Density", 
+                       variable=self.individual_central_density_var, 
+                       command=self._plot_individual_simulation).pack(side=tk.LEFT, padx=10)
 
-        # Replace text entry with Combobox for selecting train
         ttk.Label(fit_frame, text="View Train:").pack(side=tk.LEFT, padx=(5, 2))
         self.individual_train_var = tk.StringVar(value="All")
-        self.individual_train_combo = ttk.Combobox(fit_frame, textvariable=self.individual_train_var, state="readonly", width=8)
+        self.individual_train_combo = ttk.Combobox(fit_frame, textvariable=self.individual_train_var, 
+                                                    state="readonly", width=8)
         self.individual_train_combo.pack(side=tk.LEFT, padx=2)
         self.individual_train_combo.bind("<<ComboboxSelected>>", lambda e: self._plot_individual_simulation())
         
@@ -1191,7 +1203,6 @@ class ECAApp:
         self.individual_fig.clear()
         ax = self.individual_fig.add_subplot(111)
         
-        # Collect selected fit models
         selected_fits = [name for name, var in self.individual_fit_vars.items() if var.get()]
         plotted_count = 0
         
@@ -1204,7 +1215,6 @@ class ECAApp:
                 num_trains = len(model.train_times)
                 train_options = ["All"] + [str(i) for i in range(num_trains)]
                 
-                # Check if we should update default selection (due to model or fit toggles)
                 if getattr(self, '_last_doc_id', None) != doc_id or getattr(self, '_last_fits', None) != selected_fits:
                     self.individual_train_combo['values'] = train_options
                     if selected_fits:
@@ -1223,7 +1233,6 @@ class ECAApp:
             except (ValueError, IndexError, AttributeError):
                 pass
 
-        # Parse selected train
         train_str = self.individual_train_var.get().strip()
         plot_train = "All" if not train_str or train_str.lower() == "all" else int(train_str)
         
@@ -1258,8 +1267,8 @@ class ECAApp:
                 fit_max_x = 300.0
             
             model_plot(model=model, fits=fits_to_plot, size=ax, show_error=True, 
-                       central_density=cd_param, fit_maxX=fit_max_x, label=str(doc_id),
-                       train=plot_train)
+                      central_density=cd_param, fit_maxX=fit_max_x, label=str(doc_id),
+                      train=plot_train)
             plotted_count += 1
         
         if plotted_count > 0:
@@ -1272,13 +1281,11 @@ def main():
     """Main entry point for the application."""
     root = tk.Tk()
     
-    # Check for command-line argument specifying database file
-    db_file = None
-    if len(sys.argv) > 1:
-        db_file = sys.argv[1]
+    db_file = sys.argv[1] if len(sys.argv) > 1 else None
     
     app = ECAApp(root, db_file=db_file)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()

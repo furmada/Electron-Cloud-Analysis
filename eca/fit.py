@@ -2,6 +2,7 @@ from eca import ECModel
 
 import numpy as np
 from scipy.optimize import curve_fit
+from functools import partial as functools_partial
 
 
 class DataSelector(object):

@@ -14,8 +14,9 @@ from typing import Optional, List, Dict, Any, Callable
 import numpy as np
 
 try:
-    from eca import SimDB, InstabilityModel, InstabilityDBFolder, WhereIn
-    from ecaplots import (
+    from eca import SimDB, WhereIn
+    from eca.instability import InstabilityModel, InstabilityDBFolder
+    from eca.plots import (
         instability_grid_plot,
         growth_rate_vs_density_plot,
         blowup_time_vs_strength_plot,
@@ -27,54 +28,36 @@ try:
     from matplotlib.figure import Figure
 except ImportError as e:
     print(f"Error importing Instability modules: {e}")
-    print("Make sure eca.py and ecaplots.py are in the same directory or PYTHONPATH")
+    print("Make sure eca package is properly installed in PYTHONPATH")
     sys.exit(1)
 
 
 class FilterDefinition:
-    """Serializable filter definition for copy-paste support (reused from ecagui)."""
+    """Serializable filter definition for copy-paste support."""
 
     @staticmethod
-    def to_dict(filter_obj: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert filter object to serializable dictionary."""
-        result = {"type": filter_obj["type"]}
-        
-        if filter_obj["type"] == "exact":
-            result["property"] = filter_obj["property"]
-            result["values"] = [
-                str(v) if isinstance(v, (list, np.ndarray)) else v 
-                for v in filter_obj["values"]
-            ]
-        elif filter_obj["type"] == "condition":
-            result["property"] = filter_obj["property"]
-            result["operator"] = filter_obj["operator"]
-            result["value"] = filter_obj["value"]
+    def to_dict(f: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert filter to serializable dictionary."""
+        result = {"type": f["type"]}
+        if f["type"] == "exact":
+            result["property"] = f["property"]
+            result["values"] = [str(v) if isinstance(v, (list, np.ndarray)) else v for v in f["values"]]
+        elif f["type"] == "condition":
+            result["property"] = f["property"]
+            result["operator"] = f["operator"]
+            result["value"] = f["value"]
         else:  # expression
-            result["expr"] = filter_obj["expr"]
-        
+            result["expr"] = f["expr"]
         return result
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> Dict[str, Any]:
-        """Reconstruct filter object from serialized dictionary."""
+        """Reconstruct filter from serialized dictionary."""
         if data["type"] == "exact":
-            return {
-                "type": "exact",
-                "property": data["property"],
-                "values": data["values"]
-            }
+            return {"type": "exact", "property": data["property"], "values": data["values"]}
         elif data["type"] == "condition":
-            return {
-                "type": "condition",
-                "property": data["property"],
-                "operator": data["operator"],
-                "value": data["value"]
-            }
-        else:  # expression
-            return {
-                "type": "expression",
-                "expr": data["expr"]
-            }
+            return {"type": "condition", "property": data["property"], "operator": data["operator"], "value": data["value"]}
+        return {"type": "expression", "expr": data["expr"]}
 
     @staticmethod
     def serialize_all(filters: List[Dict[str, Any]]) -> str:
@@ -96,7 +79,6 @@ class FilterDefinition:
 class InstabApp:
     """Main application class for Instability Analysis GUI."""
 
-    # Common instability-related keys for quick filtering
     INSTAB_KEYS = [
         "growth_rate_centroid", "growth_rate_mode", "dominant_mode_idx",
         "tune_centroid", "blowup_turn_first", "max_emittance_ratio",
@@ -121,16 +103,13 @@ class InstabApp:
 
     def _setup_window(self):
         """Initialize window properties."""
-        title_prefix = "[TEMP WINDOW] " if self.is_temp else ""
-        self.root.title(f"{title_prefix}Instab GUI - Instability Analysis")
+        title = f"{'[TEMP] ' if self.is_temp else ''}Instab GUI - Instability Analysis"
+        self.root.title(title)
         self.root.geometry("1400x900")
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     def _setup_fonts(self):
         """Configure application fonts."""
-        for font_name in ["TkDefaultFont", "TkTextFont", "TkFixedFont"]:
-            tkfont.nametofont(font_name).configure(size=11)
-        
         style = ttk.Style()
         style.configure(".", font="TkDefaultFont")
         style.configure("Treeview.Heading", font="TkDefaultFont", weight="bold")
@@ -139,13 +118,11 @@ class InstabApp:
         """Populate UI if initialized with an existing database."""
         if not self.db:
             return
-        
         self._update_overview_tab()
         self._populate_filter_options()
         self._populate_plot_options()
         self._populate_individual_options()
         self._update_individual_sim_list()
-        
         label_text = "Loaded: Extracted Temp DB" if self.is_temp else "Loaded Database"
         self.info_label.config(text=label_text)
         self._update_status(f"Loaded {len(self.db.where())} simulations")
@@ -167,19 +144,13 @@ class InstabApp:
         """Format values consistently for display."""
         if isinstance(val, bool):
             return str(val)
-        
         if isinstance(val, (int, float, np.number)):
             if np.isnan(val) or np.isinf(val):
                 return str(val)
-            
             abs_val = abs(val)
             if abs_val >= 1000 or (abs_val < 1e-4 and abs_val > 0):
                 return f"{val:.3E}"
-            elif isinstance(val, (float, np.floating)):
-                return f"{val:.4f}"
-            else:
-                return str(int(val))
-        
+            return f"{val:.4f}" if isinstance(val, (float, np.floating)) else str(int(val))
         return str(val)
 
     # ==================== UI SETUP ====================
@@ -188,29 +159,24 @@ class InstabApp:
         """Setup the main user interface."""
         main_frame = ttk.Frame(self.root, padding="5")
         main_frame.grid(row=0, column=0, sticky="nsew")
-        
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(1, weight=1)
-        
+
         self._create_toolbar(main_frame)
-        
+
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.grid(row=1, column=0, sticky="nsew", pady=5)
-        
-        self._create_overview_tab()
-        self._create_filter_tab()
-        self._create_analysis_tab()
-        self._create_grid_tab()
-        self._create_growth_rate_tab()
-        self._create_blowup_tab()
-        self._create_mode_evolution_tab()
-        self._create_heatmap_tab()
-        self._create_versus_plot_tab()
-        self._create_histogram_tab()
-        self._create_individual_plot_tab()
-        
+
+        for method in [
+            self._create_overview_tab, self._create_filter_tab, self._create_analysis_tab,
+            self._create_grid_tab, self._create_growth_rate_tab, self._create_blowup_tab,
+            self._create_mode_evolution_tab, self._create_heatmap_tab,
+            self._create_versus_plot_tab, self._create_histogram_tab, self._create_individual_plot_tab
+        ]:
+            method()
+
         self.status_var = tk.StringVar(value="Ready")
         status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.grid(row=2, column=0, sticky="ew")
@@ -320,13 +286,11 @@ class InstabApp:
         for item in self.sim_tree.get_children():
             self.sim_tree.delete(item)
         self.prop_text.delete(1.0, tk.END)
-        
         self.active_filters_text.delete(1.0, tk.END)
         self.results_text.delete(1.0, tk.END)
         self.individual_sim_tree.delete(*self.individual_sim_tree.get_children())
         self.progress_var.set("Ready")
         
-        # Clear all plot canvases
         for fig_attr in ['grid_fig', 'growth_fig', 'blowup_fig', 'mode_fig', 'heatmap_fig', 
                         'versus_fig', 'hist_fig', 'individual_fig']:
             if hasattr(self, fig_attr):
@@ -351,7 +315,6 @@ class InstabApp:
         
         sim_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.sim_tree.yview)
         self.sim_tree.configure(yscrollcommand=sim_scroll.set)
-        
         self.sim_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sim_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
@@ -472,8 +435,6 @@ class InstabApp:
         
         self.active_filters_text = scrolledtext.ScrolledText(filters_frame, height=8, wrap=tk.WORD, font=("TkFixedFont", 9))
         self.active_filters_text.pack(fill=tk.BOTH, expand=True)
-        
-        # Add context menu for copy/paste
         self.active_filters_text.bind("<Button-3>", self._show_filter_context_menu)
         
         button_frame = ttk.Frame(tab)
@@ -572,8 +533,7 @@ class InstabApp:
         
         try:
             val = float(val_str)
-            if val.is_integer():
-                val = int(val)
+            val = int(val) if val.is_integer() else val
         except ValueError:
             val = val_str
         
@@ -822,11 +782,10 @@ class InstabApp:
         
         for i, model in enumerate(models):
             try:
-                model = InstabilityModel(self.db, model)
+                model = InstabilityModel(self.db.db, model)
                 self.progress_var.set(f"Analyzing: {i+1}/{len(models)} - Doc ID: {model.doc_id}")
                 self.root.update()
                 
-                # Run the analyze() method which generates all properties
                 model.run_analysis()
                 success_count += 1
                 
@@ -834,12 +793,10 @@ class InstabApp:
                 failed_count += 1
                 self.results_text.insert(tk.END, f"Error analyzing Doc ID {model.doc_id}: {str(e)}\n")
         
-        # Reload the database to pick up new properties
         if success_count > 0:
             try:
                 self._update_status("Reloading database with new properties...")
                 self.root.update()
-                # Refresh all tabs to show new data
                 self._refresh_all_tabs()
             except Exception as e:
                 self.results_text.insert(tk.END, f"\nError reloading database: {str(e)}\n")
@@ -855,7 +812,7 @@ class InstabApp:
         self.progress_var.set(f"Analysis complete: {success_count}/{total} successful")
         self._update_status(f"Analysis complete: {success_count}/{total} successful")
 
-    # ==================== GRID TAB ====================
+    # ==================== PLOT TABS ====================
 
     def _create_grid_tab(self):
         """Create the Grid visualization tab."""
@@ -923,8 +880,6 @@ class InstabApp:
             messagebox.showerror("Error", f"Grid plot generation failed: {str(e)}")
             self._update_status("Error generating grid plot")
 
-    # ==================== GROWTH RATE TAB ====================
-
     def _create_growth_rate_tab(self):
         """Create the Growth Rate vs Density tab."""
         tab = ttk.Frame(self.notebook, padding="10")
@@ -985,8 +940,6 @@ class InstabApp:
             messagebox.showerror("Error", f"Growth rate plot generation failed: {str(e)}")
             self._update_status("Error generating growth rate plot")
 
-    # ==================== BLOWUP TAB ====================
-
     def _create_blowup_tab(self):
         """Create the Blow-up Time vs Strength tab."""
         tab = ttk.Frame(self.notebook, padding="10")
@@ -1046,8 +999,6 @@ class InstabApp:
         except Exception as e:
             messagebox.showerror("Error", f"Blow-up plot generation failed: {str(e)}")
             self._update_status("Error generating blow-up plot")
-
-    # ==================== MODE EVOLUTION TAB ====================
 
     def _create_mode_evolution_tab(self):
         """Create the Mode Evolution tab."""
@@ -1113,8 +1064,6 @@ class InstabApp:
             messagebox.showerror("Error", f"Mode evolution plot generation failed: {str(e)}")
             self._update_status("Error generating mode evolution plot")
 
-    # ==================== HEATMAP TAB ====================
-
     def _create_heatmap_tab(self):
         """Create the Intra-bunch Heatmap tab."""
         tab = ttk.Frame(self.notebook, padding="10")
@@ -1179,8 +1128,6 @@ class InstabApp:
             messagebox.showerror("Error", f"Heatmap generation failed: {str(e)}")
             self._update_status("Error generating heatmap")
 
-    # ==================== VERSUS PLOT TAB ====================
-
     def _create_versus_plot_tab(self):
         """Create the Versus Plot tab for database-wide plots."""
         tab = ttk.Frame(self.notebook, padding="10")
@@ -1239,13 +1186,10 @@ class InstabApp:
             
             db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
             
-            # Extract data
-            x_data = []
-            y_data = []
+            x_data, y_data = [], []
             for doc in db_to_use.db.all():
                 if x_prop in doc and y_prop in doc:
-                    x_val = doc[x_prop]
-                    y_val = doc[y_prop]
+                    x_val, y_val = doc[x_prop], doc[y_prop]
                     if isinstance(x_val, (int, float, np.number)) and isinstance(y_val, (int, float, np.number)):
                         if np.isfinite(x_val) and np.isfinite(y_val):
                             x_data.append(x_val)
@@ -1263,8 +1207,6 @@ class InstabApp:
                 messagebox.showwarning("Warning", "No valid data points found for the selected properties")
         except Exception as e:
             messagebox.showerror("Error", f"Plot generation failed: {str(e)}")
-
-    # ==================== HISTOGRAM TAB ====================
 
     def _create_histogram_tab(self):
         """Create the Histogram tab."""
@@ -1328,7 +1270,6 @@ class InstabApp:
             
             db_to_use = self.db.extract(self.db.all_keys(), **self.search_criteria) if self.search_criteria else self.db
             
-            # Extract data
             data = []
             for doc in db_to_use.db.all():
                 if prop in doc:
@@ -1350,8 +1291,6 @@ class InstabApp:
                 messagebox.showwarning("Warning", "No valid data found for the selected property")
         except Exception as e:
             messagebox.showerror("Error", f"Histogram generation failed: {str(e)}")
-
-    # ==================== INDIVIDUAL PLOT TAB ====================
 
     def _create_individual_plot_tab(self):
         """Create the Individual Simulation Plot tab."""
@@ -1432,7 +1371,6 @@ class InstabApp:
             self.individual_sim_tree.heading(col, text=col)
             self.individual_sim_tree.column(col, width=120 if col != "doc_id" else 60)
         
-        # Only show simulations that match current filter
         simulations = self.db.where(**self.search_criteria) if self.search_criteria else self.db.where()
         for sim in simulations:
             values = [sim.doc_id if col == "doc_id" else self._format_value(sim.get(col, "N/A")) 
@@ -1472,7 +1410,6 @@ class InstabApp:
         # Plot evolution data
         self.individual_fig.clear()
         try:
-            # Create subplots for different observables
             n_plots = 3
             for i, (data_attr, label) in enumerate([
                 ('mean_x', 'Centroid X'),
@@ -1510,47 +1447,27 @@ class InstabApp:
         
         plotable_props = self._get_plotable_properties()
         
-        # Update growth rate dropdowns
-        if hasattr(self, 'growth_density_combo'):
-            self.growth_density_combo['values'] = plotable_props
-            if "init_unif_edens_dip" in plotable_props:
-                self.growth_density_var.set("init_unif_edens_dip")
-            elif len(plotable_props) > 0:
-                self.growth_density_var.set(plotable_props[0])
+        # Update all plot dropdowns efficiently
+        dropdown_configs = [
+            (self.growth_density_combo, self.growth_density_var, "init_unif_edens_dip"),
+            (self.growth_rate_combo, self.growth_rate_var, "growth_rate_mode"),
+            (self.blowup_strength_combo, self.blowup_strength_var, "strength_factor"),
+            (self.blowup_turns_combo, self.blowup_turns_var, "blowup_turn_first"),
+            (self.versus_x_combo, self.versus_x_var, None),
+            (self.versus_y_combo, self.versus_y_var, None),
+            (self.hist_prop_combo, self.hist_prop_var, None),
+        ]
         
-        if hasattr(self, 'growth_rate_combo'):
-            self.growth_rate_combo['values'] = plotable_props
-            if "growth_rate_mode" in plotable_props:
-                self.growth_rate_var.set("growth_rate_mode")
-            elif "growth_rate_centroid" in plotable_props:
-                self.growth_rate_var.set("growth_rate_centroid")
-            elif len(plotable_props) > 0:
-                self.growth_rate_var.set(plotable_props[0])
+        for combo, var, default in dropdown_configs:
+            if hasattr(self, combo.winfo_name() if hasattr(combo, 'winfo_name') else ''):
+                combo['values'] = plotable_props
+                if default and default in plotable_props:
+                    var.set(default)
+                elif len(plotable_props) > 0:
+                    var.set(plotable_props[0])
         
-        # Update blowup dropdowns
-        if hasattr(self, 'blowup_strength_combo'):
-            self.blowup_strength_combo['values'] = plotable_props
-            if "strength_factor" in plotable_props:
-                self.blowup_strength_var.set("strength_factor")
-            elif len(plotable_props) > 0:
-                self.blowup_strength_var.set(plotable_props[0])
-        
-        if hasattr(self, 'blowup_turns_combo'):
-            self.blowup_turns_combo['values'] = plotable_props
-            if "blowup_turn_first" in plotable_props:
-                self.blowup_turns_var.set("blowup_turn_first")
-            elif len(plotable_props) > 0:
-                self.blowup_turns_var.set(plotable_props[0])
-        
-        # Update versus and histogram dropdowns
-        if hasattr(self, 'versus_x_combo'):
-            self.versus_x_combo['values'] = plotable_props
-        if hasattr(self, 'versus_y_combo'):
-            self.versus_y_combo['values'] = plotable_props
         if hasattr(self, 'versus_color_combo'):
             self.versus_color_combo['values'] = ["None"] + plotable_props
-        if hasattr(self, 'hist_prop_combo'):
-            self.hist_prop_combo['values'] = plotable_props
 
     def _get_plotable_properties(self) -> List[str]:
         """Get list of plotable properties from database."""
