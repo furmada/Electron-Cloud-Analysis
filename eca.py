@@ -489,8 +489,6 @@ class SimDB(object):
                 keys.add(k)
         return list(sorted(keys))
 
-# In eca.py, replace the WhereIn class with this improved version:
-
 class WhereIn(object):
     """
     Addon to db.where functionality enabling matching to any one of a set of items.

@@ -61,7 +61,7 @@ def read_flux_data(flux_files: list[str] | str | tuple) -> np.ndarray:
         x_coord = np.concatenate((x_coord, flux_data[0] / 100), axis=None) # Given in cm, we want m
         y_coord = np.concatenate((y_coord, flux_data[1] / 100), axis=None)
         z_coord = np.concatenate((z_coord, flux_data[2] / 100), axis=None)
-        F_value = np.concatenate((F_value, flux_data[3]), axis=None)
+        F_value = np.concatenate((F_value, flux_data[3] * 1e4), axis=None)
     order = np.argsort(z_coord).ravel()
     return np.array([x_coord.ravel()[order], y_coord.ravel()[order], z_coord.ravel()[order], F_value.ravel()[order]])
 
@@ -138,7 +138,7 @@ def _max_inscribed_ellipse(X: np.ndarray, Y: np.ndarray) -> tuple[np.number, np.
     a, b = result.x * (1 - 100*np.sum(np.maximum(1.0 - (points[:, 0]**2 / result.x[0]**2 + points[:, 1]**2 / result.x[1]**2), 0.0)))
     return a, b
 
-def make_matfiles(Z: float, zslice: np.ndarray, dZ: float = 1.0, output_dir: str = "output", k_pe_sts: Iterable[float] = [1e-6, 1e-5, 1e-4, 1e-3]) -> tuple[list[str], list[str]]:
+def make_matfiles(Z: float, zslice: np.ndarray, output_dir: str = "output", k_pe_sts: Iterable[float] = [1e-6, 1e-5, 1e-4, 1e-3]) -> tuple[list[str], list[str]]:
     """
     Take the "zslice" containing points (X, Y, Flux) - the output of slice_flux_data, and output the PyECLOUD .mat files.
     """
@@ -146,7 +146,7 @@ def make_matfiles(Z: float, zslice: np.ndarray, dZ: float = 1.0, output_dir: str
     # Compute the segment lengths
     seg_len: Unknown = np.sqrt(np.diff(x_b, append=x_b[0])**2 + np.diff(y_b, append=y_b[0])**2)
     # Total Flux
-    total_flux = float(np.sum(f_b * seg_len) * dZ)
+    total_flux = float(np.sum(f_b * seg_len))
     # Compute the length-weighted flux distribution
     cumdist = np.cumsum((f_b * seg_len) / (np.sum(f_b * seg_len)))
     # Fit ellipse
@@ -175,7 +175,7 @@ def make_matfiles(Z: float, zslice: np.ndarray, dZ: float = 1.0, output_dir: str
         photo_file = join(output_dir, output_pho)
         sio.savemat(chm_file, vtx_dict, oned_as='row')
         sio.savemat(photo_file, photo_dict, oned_as='row')
-        print("-> Z={:.2f} k_pe_st={:.2E}, wrote {}, {}".format(Z, k_pe_st, chm_file, photo_file))
+        print("-> Z={:.2f} k_pe_st={:.2E}, F={:.2E}, wrote {}, {}".format(Z, k_pe_st, total_flux, chm_file, photo_file))
         chm_files.append(chm_file)
         photo_files.append(photo_file)
     return (chm_files, photo_files)
