@@ -1,4 +1,6 @@
-from eca import *
+from eca import ECModel, SimDB
+from eca.instability import InstabilityModel
+
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.colors import Colormap, Normalize

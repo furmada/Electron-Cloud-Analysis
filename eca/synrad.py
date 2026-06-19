@@ -1,9 +1,3 @@
-"""
-Synchrotron Radiation Flux analysis tools for use with PyECLOUD and Electron Cloud Analysis
-@author Adam Furman
-@email adam.furman@cern.ch
-"""
-
 import warnings
 from typing import Iterable
 import numpy as np

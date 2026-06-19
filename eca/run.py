@@ -1,11 +1,7 @@
-"""
-EcA - Electron Cloud Analysis Job Runner
-@author Adam Furman
-@email adam.furman@cern.ch
+from eca import realpath
 
-For use with PyECLOUD.
-"""
-import os, stat
+import os
+import stat
 from subprocess import run as sp_run
 from datetime import datetime
 
@@ -14,7 +10,7 @@ class RunTarget(object):
     A RunTarget is an abstract representation of a destination for running simulations.
     """
     def __init__(self, job_folders: list[str]):
-        self.job_folders = list(sorted([os.path.realpath(os.path.normpath(f)) for f in job_folders if os.path.exists(f)]))
+        self.job_folders = list(sorted([realpath(f) for f in job_folders if os.path.exists(f)]))
 
     def __len__(self) -> int:
         return len(self.job_folders)
