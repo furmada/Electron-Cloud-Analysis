@@ -3,7 +3,7 @@ from shutil import copy2
 from itertools import product
 import numpy as np
 from scipy.io import loadmat
-from typing import Iterable, Callable
+from typing import Any, Iterable, Callable
 
 from tinydb import JSONStorage, TinyDB, Query
 from tinydb.storages import MemoryStorage, JSONStorage
@@ -276,7 +276,7 @@ class SimDB(object):
             raise ValueError()
         return False
 
-    def insert(self, *documents: list[dict | Document]):
+    def insert(self, *documents: dict | Document):
         """
         Manually insert document(s) into the database, for example when merging databases.
         The validity or completeness of inserted documents is not checked!
@@ -299,7 +299,7 @@ class SimDB(object):
         # Searching by document ID requires special handling
         if "doc_id" in search:
             if isinstance(search["doc_id"], WhereIn):
-                return [self.db.get(doc_id=int(i)) for i in search["doc_id"].match]
+                return [self.db.get(doc_id=int(i)) for i in search["doc_id"].match if not isinstance(i, tuple)]
             elif isinstance(search["doc_id"], Callable):
                 return [r for r in self.db.all() if search["doc_id"](r.doc_id, r)]
             return [self.db.get(doc_id=int(search["doc_id"]))]
@@ -467,7 +467,7 @@ class WhereIn(object):
     Addon to db.where functionality enabling matching to any one of a set of items.
     """
     def __init__(self, *items, str_match=True):
-        self.match = [tuple(i) if isinstance(i, list) or isinstance(i, np.ndarray) else i for i in items]
+        self.match: list[tuple | Any] = [tuple(i) if isinstance(i, list) or isinstance(i, np.ndarray) else i for i in items]
         if str_match:
             self.match_str = {str(item) for item in items}
     
@@ -619,8 +619,9 @@ class ECModel(SynchedEntry):
     def __init__(self, db: TinyDB | SimDB, doc: int | Document):
         result = doc if isinstance(doc, Document) else (db if isinstance(db, TinyDB) else db.db).get(doc_id=doc)
         if result is None: raise KeyError("The provided doc_id={} does not exist in the database!".format(doc))
+        if isinstance(result, list): result = result[0]
         super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, ECModel.PROPERTIES)
-        self.doc_id = result.doc_id
+        self.doc_id: int = result.doc_id
         # Populate this object with information from the database entry
         for k, v in result.items():
             self.set_sync(k)
@@ -630,44 +631,44 @@ class ECModel(SynchedEntry):
                 setattr(self, "_"+k, v)
 
     @property
-    def data(self):
+    def data(self) -> np.ndarray:
         if not hasattr(self, "_data"):
-            self._data = loadmat(os.path.join(self.path, DBFolder.FILENAMES["data"]))
+            self._data = np.array(loadmat(os.path.join(self.path, DBFolder.FILENAMES["data"])))
         return self._data
 
     @property
-    def time(self):
+    def time(self) -> np.ndarray:
         return self.data["t"].ravel()
 
     @property
-    def N_electrons(self):
+    def N_electrons(self) -> np.ndarray:
         return self.data["Nel_timep"].ravel()
 
     @property
-    def central_density(self):
+    def central_density(self) -> np.ndarray:
         return self.data["cen_density"].ravel()
 
     @property
-    def N_sec(self):
+    def N_sec(self) -> np.ndarray:
         return self.data["Nel_emit_time"].ravel()
 
     @property
-    def N_col(self):
+    def N_col(self) -> np.ndarray:
         return self.data["Nel_imp_time"].ravel()
 
     @property
-    def intensity(self):
+    def intensity(self) -> np.ndarray:
         return self.data["lam_t_array"].ravel()
 
     @property
-    def smooth(self):
+    def smooth(self) -> np.ndarray:
         if not hasattr(self, "_smooth"):
             conv_window = int(2*self.bunch_step)
             self._smooth = smooth(self.N_electrons, conv_window)
         return self._smooth
 
     @property
-    def smooth_diff(self):
+    def smooth_diff(self) -> np.ndarray:
         if not hasattr(self, "_smooth_diff"):
             conv_window = int(2*self.bunch_step)
             self._smooth_diff = smooth(np.diff(self.smooth, n=1), conv_window)
@@ -682,7 +683,7 @@ class ECModel(SynchedEntry):
                 raise ValueError("Requested synced property {} for which no generator is defined!".format(attr))
         return super()._sync_get(attr)
 
-    def time_to_index(self, t: np.ndarray | np.number | float) -> np.ndarray | np.integer:
+    def time_to_index(self, t: np.ndarray | np.number | float) -> np.ndarray | np.integer | int:
         """
         Convert time(s) to corresponding index(es) in the time array (floor-wise).
         """
@@ -728,59 +729,59 @@ class ECModel(SynchedEntry):
         True if multipacting buildup is detected
         """
         try:
-            self.buildup = np.mean(self.smooth_diff[:self.cutoff:self.bunch_step]) > 0
+            self.buildup: bool = bool(np.mean(self.smooth_diff[:self.cutoff:self.bunch_step]) > 0)
         except:
-            self.buildup = False
+            self.buildup: bool = False
 
     def gen_bunch_step(self):
         """
         The number of indexes corresponding to b_spac
         """
-        self.bunch_step = self.time_to_index(self.b_spac)
+        self.bunch_step: int = int(self.time_to_index(self.b_spac))
 
     def gen_bunch_times(self):
         """
         The times corresponding to maximum beam intensity.
         """
-        self.bunch_times = self.t_offs + (self.b_spac * np.argwhere(self.filling_pattern_file == 1).ravel())
+        self.bunch_times: np.ndarray = self.t_offs + (self.b_spac * np.argwhere(self.filling_pattern_file == 1).ravel())
 
     def gen_cutoff(self):
         """
         The index into the data arrays corresponding to the last bunch passage
         """
-        self.cutoff = min(min(self.time.size, self.N_electrons.size)-1, self.time_to_index(self.bunch_times[-1]))
+        self.cutoff: int = min(min(self.time.size, self.N_electrons.size)-1, int(self.time_to_index(self.bunch_times[-1])))
 
     def gen_half_bunch(self):
         """
         The true half-width of the simulated Gaussian bunch.
         """
         if self.time.size == 0 or self.time[-1] <= self.t_offs:
-            self.half_bunch = self.t_offs
+            self.half_bunch: float = self.t_offs
         else:
-            self.half_bunch = self.t_offs - self.time[np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]]
+            self.half_bunch: float = self.t_offs - self.time[np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]]
 
     def gen_magnet(self):
         """
         The type of magnetic section.
         """
         if len(self.B_multip) == 1 and self.B_multip[0] == 0:
-            self.magnet = 0
+            self.magnet: int = 0
             return
-        self.magnet = 2 * len(self.B_multip)
+        self.magnet: int = 2 * len(self.B_multip)
 
     def gen_mean_intensity(self):
         """
         The mean beam intensity.
         """
         start = np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]
-        self.mean_intensity = np.mean(self.intensity[start:start+self.time_to_index(self.b_spac)])
+        self.mean_intensity: np.floating = np.mean(self.intensity[start:start+self.time_to_index(self.b_spac)])
 
     def gen_Ne_0(self):
         """
         The initial amount of electrons - note that we do not use N_electrons[0] - instead, we take the amount at the point
         before the start of the first bunch passage.
         """
-        self.Ne_0 = self.N_electrons[np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]]
+        self.Ne_0: float = float(self.N_electrons[np.argwhere(self.intensity[:self.time_to_index(self.t_offs)] > 0).ravel()[0]])
     
     def gen_perimeter(self):
         """
@@ -797,10 +798,10 @@ class ECModel(SynchedEntry):
         order = np.argsort(angle)
         Vx, Vy = Vx[order], Vy[order]
         Vx, Vy = np.append(Vx, Vx[0]), np.append(Vy, Vy[0])
-        self.perimeter = np.sum(
+        self.perimeter: float = np.sum(
             np.sqrt(np.diff(Vx)**2 + np.diff(Vy)**2)
         )
-        self.area = 0.5 * np.abs(
+        self.area: float = 0.5 * np.abs(
             np.sum(Vx[:-1] * Vy[1:] - Vx[1:] * Vy[:-1])
         )
 
@@ -829,7 +830,7 @@ class ECModel(SynchedEntry):
         first_train_start = self.t_offs + (filled_slots[0] * self.b_spac)
         # Calculate starts for subsequent trains based on pattern duration
         num_repetitions = int(np.ceil(sim_duration / pattern_duration))
-        self.train_times = np.array([
+        self.train_times: np.ndarray = np.array([
             first_train_start + (i * pattern_duration) 
             for i in range(num_repetitions)
         ])

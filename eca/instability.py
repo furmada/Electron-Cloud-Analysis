@@ -79,7 +79,8 @@ class InstabilityModel(SynchedEntry):
         result = doc if isinstance(doc, Document) else (db if isinstance(db, TinyDB) else db.db).get(doc_id=doc)
         if result is None:
             raise KeyError(f"Document with doc_id={doc} not found in database")
-        
+        if isinstance(result, list): result = result[0]
+
         super().__init__(db if isinstance(db, TinyDB) else db.db, result.doc_id, self.PROPERTIES)
         self.doc_id = result.doc_id
         
@@ -289,7 +290,7 @@ class InstabilityModel(SynchedEntry):
             start = i * hop_size
             end = start + window_size
             segment = data[start:end, :] * window[:, np.newaxis]
-            fft_seg = scipy.fft.rfft(segment, axis=0)
+            fft_seg = np.array(scipy.fft.rfft(segment, axis=0))
             power_matrix[:, i] = np.mean(np.abs(fft_seg) ** 2, axis=1)
         
         self._slice_fft_cache = power_matrix
@@ -348,7 +349,7 @@ class InstabilityModel(SynchedEntry):
             r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
             
             self.growth_rate_centroid = coeffs[0]
-            self.growth_rate_r_squared = max(0.0, r_squared)
+            self.growth_rate_r_squared = max(0.0, float(r_squared))
         except Exception:
             self.growth_rate_centroid, self.growth_rate_r_squared = np.nan, 0.0
 

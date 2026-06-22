@@ -1,8 +1,11 @@
-from eca import ECModel
+from eca import ECModel, SimDB
 
 import numpy as np
 from scipy.optimize import curve_fit
+from scipy.constants import c
 from functools import partial as functools_partial
+from typing import Any, Callable, Iterable
+from tinydb.middlewares import CachingMiddleware
 
 
 class DataSelector(object):
@@ -178,7 +181,7 @@ class Fit(object):
                     return float(min(yc_alg, max_y * 5.0)) 
             return max_y * 1.5
 
-    def _mget(self, attr: str, model: ECModel, default=False):
+    def _mget(self, attr: str, model: ECModel, default: Any = False):
         return getattr(model, self.name+"_"+attr) if hasattr(model, "_"+self.name+"_"+attr) or hasattr(model, self.name+"_"+attr) else default
     
     def _mset(self, attr: str, value, model: ECModel):
@@ -244,14 +247,17 @@ class Fit(object):
 
     def fit_function(self, model: ECModel, params: np.ndarray | None = None) -> Callable[..., np.ndarray]:
         if params is None:
-            if (p_fit := self.fit(model)) is None: raise RuntimeError("Cannot return a function for a failed fit!")
-            params = p_fit[0]
+            p_fit = self.fit(model)
+            if p_fit is None:
+                raise RuntimeError("Cannot return a function for a failed fit!")
+            else:
+                params = p_fit[0]
         scale_x = self._mget("scale_x", model, default=1)
         scale_y = self._mget("scale_y", model, default=1)
         if not scale_x or not scale_y:
             scale_x, scale_y = self.scale_factor(model, *self.select_data(model))
         target = self._make_target()
-        fn = lambda x: target(scale_x * x, *params[~self.fixed]) / scale_y
+        fn = lambda x: target(scale_x * x, *(params[~self.fixed] if params is not None else [])) / scale_y
         setattr(fn, "variables", self.variables)
         setattr(fn, "parameters", params)
         setattr(fn, "model", self.name)
@@ -391,10 +397,10 @@ class FurmanPhotoFit(FurmanBaseFit):
                 return None
                 
             dYdX = np.diff(Y) / np.where(np.diff(X) == 0, 1e-12, np.diff(X))
-            m0 = max(np.mean(dYdX[:max(1, len(dYdX)//20)]), 1e-12)
+            m0 = max(float(np.mean(dYdX[:max(1, len(dYdX)//20)])), 1e-12)
             
             yc_init = max(np_result[0, 0], self.limit_estimate(xdata, ydata) * scale_y)
-            alpha_init = max(min(model.k_pe_st * scipy.constants.c * model.b_spac * 0.1, m0), 1e-8)
+            alpha_init = max(min(model.k_pe_st * c * model.b_spac * 0.1, m0), 1e-8)
             beta_init = max(4.0 * (np.max(dYdX) - alpha_init) / (yc_init**2), 1e-8)
             delta_p0 = max(0.5 * (-yc_init + np.sqrt(yc_init**2 + 4.0 * alpha_init / beta_init)), 1e-8)
 
@@ -404,7 +410,7 @@ class FurmanPhotoFit(FurmanBaseFit):
                 denom = (Y[0] + delta) + (yc + delta - Y[0]) * E
                 return ((yc + delta) * (Y[0] + delta) + (-delta) * (yc + delta - Y[0]) * E) / np.where(denom == 0, 1e-12, denom)
 
-            result, covariance = scipy.optimize.curve_fit(
+            result, covariance = curve_fit(
                 stable_delta_target, X, Y, p0=[yc_init, delta_p0, beta_init],
                 bounds=([Y[0], 1e-8, 0.0], [yc_init * 1.1, max(np.max(Y) * 5.0, 10.0), max(beta_init * 10.0, 10.0)]),
                 loss="arctan", maxfev=int(1e5), nan_policy="omit", ftol=1e-12, xtol=1e-12, x_scale="jac"
@@ -457,16 +463,32 @@ class PhotoGammaFit(FurmanBaseFit):
             xdata, ydata = self.select_data(model)
         scale_x, scale_y = self.scale_factor(model, xdata, ydata)
         self.fix({"y0": ydata[0] * scale_y})
-        bounds = {
-            "yc": (ydata[0] * scale_y, np.inf),
-            "beta": (-np.inf, np.inf),
-            "gamma": (0, np.inf)
-        }
-        self.initial({
-            "yc": ydata[-1] * scale_y,
-            "beta": 1.0 if model.buildup else -1.0,
-            "gamma": 0
-        })
+        if model.buildup:
+            L = self.limit_estimate(xdata, ydata)
+            bounds = {
+                "yc": (ydata[0] * scale_y, L),
+                "beta": (0, np.inf),
+                "gamma": (0, L)
+            }
+            self.initial({
+                "yc": 0.5*L,
+                "beta": np.log(model.del_max) / (2 * L * model.b_spac),
+                "gamma": 0.25*L
+            })
+        else:
+            ymax = np.max(ydata) * scale_y
+            bounds = {
+                "yc": (0, ymax),
+                "beta": (0, np.inf),
+                "gamma": (0, ymax)
+            }
+            self.initial({
+                "yc": 0.1*ymax,
+                "beta": 1,
+                "gamma": ymax
+            })
+        self.bound(bounds)
+        return super().fit(model, refit, xdata, ydata)
 
 
 def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True, **search):
