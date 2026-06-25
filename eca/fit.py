@@ -464,22 +464,22 @@ class PhotoGammaFit(FurmanBaseFit):
         scale_x, scale_y = self.scale_factor(model, xdata, ydata)
         self.fix({"y0": ydata[0] * scale_y})
         if model.buildup:
-            L = self.limit_estimate(xdata, ydata)
+            L = self.limit_estimate(xdata, ydata) * scale_y
             bounds = {
-                "yc": (ydata[0] * scale_y, L),
-                "beta": (0, np.inf),
-                "gamma": (0, L)
+                "yc": (ydata[0] * scale_y, 1.5*L),
+                "beta": (0, 3 * model.del_max if getattr(model, "k_pe_st", 0) < 1e-6 else 10 * model.del_max),
+                "gamma": (0, np.sqrt(((1.5*L)**2)/2) + (4*c*model.b_spac*getattr(model, "k_pe_st", 0)/model.del_max))
             }
             self.initial({
                 "yc": 0.5*L,
-                "beta": np.log(model.del_max) / (2 * L * model.b_spac),
+                "beta": model.del_max,
                 "gamma": 0.25*L
             })
         else:
             ymax = np.max(ydata) * scale_y
             bounds = {
                 "yc": (0, ymax),
-                "beta": (0, np.inf),
+                "beta": (0, 3 * model.del_max if getattr(model, "k_pe_st", 0) < 1e-6 else 10 * model.del_max),
                 "gamma": (0, ymax)
             }
             self.initial({

@@ -138,11 +138,12 @@ def make_matfiles(Z: float, zslice: np.ndarray, output_dir: str = "output", k_pe
     """
     x_b, y_b, f_b = zslice[0], zslice[1], zslice[2]
     # Compute the segment lengths
-    seg_len: Unknown = np.sqrt(np.diff(x_b, append=x_b[0])**2 + np.diff(y_b, append=y_b[0])**2)
+    seg_len: np.ndarray = np.sqrt(np.diff(x_b, append=x_b[0])**2 + np.diff(y_b, append=y_b[0])**2)
     # Total Flux
     total_flux = float(np.sum(f_b * seg_len))
     # Compute the length-weighted flux distribution
     cumdist = np.cumsum((f_b * seg_len) / (np.sum(f_b * seg_len)))
+    cumdist[-1] = 1.0
     # Fit ellipse
     x_sem_ellip_insc, y_sem_ellip_insc = _max_inscribed_ellipse(x_b, y_b)
     print("Chamber with {} vertices. Circumference {:.2f}, weighted flux sum={:.2f}. x_semi={:.4f}, y_semi={:.4f}".format(

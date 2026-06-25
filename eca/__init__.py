@@ -631,9 +631,9 @@ class ECModel(SynchedEntry):
                 setattr(self, "_"+k, v)
 
     @property
-    def data(self) -> np.ndarray:
+    def data(self) -> dict[str, np.ndarray]:
         if not hasattr(self, "_data"):
-            self._data = np.array(loadmat(os.path.join(self.path, DBFolder.FILENAMES["data"])))
+            self._data = loadmat(os.path.join(self.path, DBFolder.FILENAMES["data"]))
         return self._data
 
     @property

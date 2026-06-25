@@ -18,6 +18,9 @@ class RunTarget(object):
     def submit(self):
         pass
 
+    def check_unfinished(self) -> list[str]:
+        return []
+
 class RunLocal(RunTarget):
     """
     Run using PyECLOUD installed on this machine.
@@ -70,6 +73,9 @@ tar -czvf output.tgz *.mat *.h5 *.txt *.input *.beam
         for i, s in enumerate(scripts):
             if verbose: print("{:<100}: {}".format(i, s))
             os.system(s)
+
+    def check_unfinished(self) -> list[str]:
+        return [f for f in self.job_folders if not any((p.endswith("Pyecltest.mat") or p.endswith(".h5")) for p in os.listdir(f))]
 
 class RunSLURM(RunLocal):
     """
