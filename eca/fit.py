@@ -127,59 +127,54 @@ class Fit(object):
         max_y = float(np.max(ydata))
         if n <= 5 or max_y == 0: return max_y
         
-        # 1. Compute derivatives globally for terminal tail checks
+        # Compute derivatives globally for terminal tail checks
         dydx = np.diff(ydata) / np.where(np.diff(xdata) == 0, 1e-12, np.diff(xdata))
-        tail_growth = np.mean(dydx[-3:])
+        tail_growth = np.mean(dydx[-5:])
         
         # Curve has naturally flattened or turned downward -> Already saturated
         if tail_growth <= 0.02 * np.max(dydx) or tail_growth <= 0:
             return max_y
 
-        # 2. Isolate the Active Buildup Zone (Fixes the late-start edge case)
-        # Define active zone where density has risen above a baseline floor (e.g., 2%)
-        active_mask = ydata > 0.02 * max_y
+        # Isolate the Active Buildup Zone
+        # Define active zone where density has risen above a baseline floor
+        active_mask = np.log(ydata) > 0.02 * np.log(max_y)
         active_idx = np.where(active_mask)[0]
-        
         if len(active_idx) < 5: 
             return max_y * 1.5  # Not enough active points to extract curvature reliably
 
         # Slice data down to the active horizon
-        y_active = ydata[active_idx]
-        x_active = xdata[active_idx]
-        dydx_active = dydx[active_idx[:-1]]  # Align derivative length
+        y_active, dydx_active = ydata[active_idx], dydx[active_idx[:-1]]
         y_mid_active = 0.5 * (y_active[:-1] + y_active[1:])
-        
         n_act = len(y_active)
 
-        if getattr(self, "photoem_flag", 0) > 0:
-            try:
-                # Fit: dydx = p0*y^2 + p1*y + p2
-                p = np.polyfit(y_mid_active, dydx_active, 2)
-                # For a stable saturating curve, the y^2 coefficient must be negative
-                if p[0] < 0:
-                    roots = np.roots(p)
-                    # We want the real root that represents forward saturation (yc > max_y)
-                    valid_roots = roots[np.isreal(roots) & (roots > max_y)]
-                    if len(valid_roots) > 0:
-                        return float(np.clip(np.min(valid_roots), max_y, max_y * 5.0))
-            except (np.linalg.LinAlgError, ValueError):
-                pass
+        # Use a polynomial to estimate limit
+        poly_estimate = max_y
+        try:
+            # Fit: dydx = p0*y^2 + p1*y + p2
+            p = np.polyfit(y_mid_active, dydx_active, 2)
+            # For a stable saturating curve, the y^2 coefficient must be negative
+            if p[0] < 0:
+                roots = np.roots(p)
+                # We want the real root that represents forward saturation (yc > max_y)
+                valid_roots = roots[np.isreal(roots) & (roots > max_y)]
+                if len(valid_roots) > 0:
+                    poly_estimate = float(np.clip(np.min(valid_roots), max_y, max_y * 5.0))
+        except (np.linalg.LinAlgError, ValueError):
+            pass
+        # Sample 3 evenly spaced points strictly *within* the active window
+        concavity_estimate = max_y
+        k = (n_act - 1) // 2
+        y1 = y_active[n_act - 1 - 2 * k]
+        y2 = y_active[n_act - 1 - k]
+        y3 = y_active[n_act - 1]
+        
+        denom = y1 * y3 - y2**2
+        if denom < 0:  # Confirms curve is concave/decelerating toward a ceiling
+            yc_alg = (2 * y1 * y2 * y3 - y2**2 * (y1 + y3)) / denom
+            if yc_alg > max_y:
+                concavity_estimate = float(min(yc_alg, max_y * 5.0)) 
             
-            return max_y * 2.0  # Photoemission fallback (generally higher/faster scaling)
-
-        else:
-            # Sample 3 evenly spaced points strictly *within* the active window
-            k = (n_act - 1) // 2
-            y1 = y_active[n_act - 1 - 2 * k]
-            y2 = y_active[n_act - 1 - k]
-            y3 = y_active[n_act - 1]
-            
-            denom = y1 * y3 - y2**2
-            if denom < 0:  # Confirms curve is concave/decelerating toward a ceiling
-                yc_alg = (2 * y1 * y2 * y3 - y2**2 * (y1 + y3)) / denom
-                if yc_alg > max_y:
-                    return float(min(yc_alg, max_y * 5.0)) 
-            return max_y * 1.5
+        return (poly_estimate + concavity_estimate) / 2
 
     def _mget(self, attr: str, model: ECModel, default: Any = False):
         return getattr(model, self.name+"_"+attr) if hasattr(model, "_"+self.name+"_"+attr) or hasattr(model, self.name+"_"+attr) else default
@@ -399,7 +394,8 @@ class FurmanPhotoFit(FurmanBaseFit):
             dYdX = np.diff(Y) / np.where(np.diff(X) == 0, 1e-12, np.diff(X))
             m0 = max(float(np.mean(dYdX[:max(1, len(dYdX)//20)])), 1e-12)
             
-            yc_init = max(np_result[0, 0], self.limit_estimate(xdata, ydata) * scale_y)
+            L = self.limit_estimate(xdata, ydata) * scale_y
+            yc_init = max(np_result[0, 0], L)
             alpha_init = max(min(model.k_pe_st * c * model.b_spac * 0.1, m0), 1e-8)
             beta_init = max(4.0 * (np.max(dYdX) - alpha_init) / (yc_init**2), 1e-8)
             delta_p0 = max(0.5 * (-yc_init + np.sqrt(yc_init**2 + 4.0 * alpha_init / beta_init)), 1e-8)
@@ -412,7 +408,7 @@ class FurmanPhotoFit(FurmanBaseFit):
 
             result, covariance = curve_fit(
                 stable_delta_target, X, Y, p0=[yc_init, delta_p0, beta_init],
-                bounds=([Y[0], 1e-8, 0.0], [yc_init * 1.1, max(np.max(Y) * 5.0, 10.0), max(beta_init * 10.0, 10.0)]),
+                bounds=([Y[0], 1e-8, 0.0], [yc_init * 1.1, max(L, 10.0), max(beta_init * 10.0, 10.0)]),
                 loss="arctan", maxfev=int(1e5), nan_policy="omit", ftol=1e-12, xtol=1e-12, x_scale="jac"
             )
             
@@ -445,7 +441,7 @@ class PhotoGammaFit(FurmanBaseFit):
     Furman-like photoemission fit with different structure.
 
     """
-    PHOTO_GAMMA = """(yc/2) + gamma*(( (2*gamma - yc + 2*y0)*np.exp(2*beta*gamma*x) - 1) / ( (2*gamma - yc + 2*y0)*np.exp(2*beta*gamma*x) + 1 ))"""
+    PHOTO_GAMMA = """(yc/2) + gamma*(( ((2*gamma - yc + 2*y0)/(2*gamma + yc - 2*y0))*np.exp(2*beta*gamma*x) - 1) / ( ((2*gamma - yc + 2*y0)/(2*gamma + yc - 2*y0))*np.exp(2*beta*gamma*x) + 1 ))"""
 
     def __init__(self, selector: None | DataSelector = None):
         super().__init__(
@@ -466,25 +462,25 @@ class PhotoGammaFit(FurmanBaseFit):
         if model.buildup:
             L = self.limit_estimate(xdata, ydata) * scale_y
             bounds = {
-                "yc": (ydata[0] * scale_y, 1.5*L),
-                "beta": (0, 3 * model.del_max if getattr(model, "k_pe_st", 0) < 1e-6 else 10 * model.del_max),
-                "gamma": (0, np.sqrt(((1.5*L)**2)/2) + (4*c*model.b_spac*getattr(model, "k_pe_st", 0)/model.del_max))
+                "yc": (ydata[0] * scale_y, 1.1*L),
+                "beta": (0, 4 * model.del_max if getattr(model, "k_pe_st", 0) < 1e-6 else 10 * model.del_max),
+                "gamma": (0, L)
             }
             self.initial({
-                "yc": 0.5*L,
+                "yc": max(ydata[0]*scale_y, L),
                 "beta": model.del_max,
                 "gamma": 0.25*L
             })
         else:
             ymax = np.max(ydata) * scale_y
             bounds = {
-                "yc": (0, ymax),
-                "beta": (0, 3 * model.del_max if getattr(model, "k_pe_st", 0) < 1e-6 else 10 * model.del_max),
-                "gamma": (0, ymax)
+                "yc": (0, 10),
+                "beta": (-1e3, 0),
+                "gamma": (0, max(ymax, 10))
             }
             self.initial({
-                "yc": 0.1*ymax,
-                "beta": 1,
+                "yc": ymax,
+                "beta": -1,
                 "gamma": ymax
             })
         self.bound(bounds)
