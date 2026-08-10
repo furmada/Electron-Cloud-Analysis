@@ -1,5 +1,5 @@
 import os
-from shutil import copy2
+from shutil import copy2, rmtree
 from itertools import product
 import numpy as np
 from scipy.io import loadmat
@@ -140,7 +140,9 @@ class TemplateSim(object):
                     f.write(contents)
         for resource in self.resources:
             if resource not in skip_resource:
-                copy2(os.path.join(self.path, resource), os.path.join(path, resource))
+                rsrc, rdest = realpath(os.path.join(self.path, resource)), realpath(os.path.join(path, resource))
+                if rsrc != rdest:
+                    copy2(rsrc, rdest)
         return path
 
     @staticmethod
@@ -197,7 +199,17 @@ class TemplateSim(object):
             # Add constant parameters
             final_config = {**constant, **merged_config}
             configurations.append(final_config)
-        return configurations                
+        return configurations
+
+    @staticmethod
+    def tweak(path: str, **changes):
+        """
+        Tweak an existing simulation's configuration files, applying changes.
+        """
+        if not os.path.exists(path):
+            raise ValueError("The provided simulation path does not exist.")
+        template = TemplateSim(path)
+        template.spawn(path, **changes)
 
 class SimDB(object):
     """
@@ -390,6 +402,18 @@ class SimDB(object):
             matching[i] = sum([1 for k in match_on if k in e and e[k] == entry[k]])
         return [all_entries[int(i)] for i in np.argwhere(matching == np.min(matching)).ravel().astype(int)]
 
+    def ensure(self, attr: str, generator: Callable[ECModel, Any], **search) -> list[int]:
+        """
+        Ensure that each entry (from the query) has the "attr" property, calling the generator if needed.
+        See the SynchedEntry ensure method.
+        Returns the list of doc_ids where the generator was called.
+        """
+        without_attr = self.where(**{"_"+attr: WhereNot(Has(attr)), **search})
+        for wa in without_attr:
+            model = ECModel(self, wa)
+            model.ensure(attr, lambda: generator(model))
+        return [wa.doc_id for wa in without_attr]
+
     def extract(self, attrs: Iterable[str], **search) -> SimDB:
         """
         Create a sub-database, extracting the properties "attrs" from documents matching the query.
@@ -471,7 +495,7 @@ class WhereIn(object):
         if str_match:
             self.match_str = {str(item) for item in items}
     
-    def query(self, value, _) -> bool:
+    def query(self, value, *_) -> bool:
         # First try exact match
         if isinstance(value, list) or isinstance(value, np.ndarray):
             value = tuple(value)
@@ -491,12 +515,29 @@ class WhereIn(object):
             return True
         return False
 
+class Has(WhereIn):
+    """
+    Matches if the database entry has the specified attribute (of any value)
+    """
+    def __init__(self, *attrs):
+        self.match = attrs
+
+    def query(self, *data):
+        result = data[-1]
+        for attr in self.match:
+            if attr not in result:
+                return False
+        return True
+
 class WhereNot(WhereIn):
     """
     Inverts the query.
     """
-    def query(self, value, _) -> bool:
-        return not super().query(value, _)
+    def __init__(self, where_in: WhereIn):
+        self.where_in = where_in
+
+    def query(self, value, *result) -> bool:
+        return not self.where_in.query(value, *result)
 
 
 class SynchedEntry(object):
