@@ -442,8 +442,8 @@ class SimDB(object):
         If a result lacks the attribute, fill with "nonexistant", defaulting to NaN.
         The paired data will be sorted by each X.
         """
-        attrX = list(attrX)
-        attrY = list(attrY)
+        attrX = list(attrX) if type(attrX) != str else [attrX]
+        attrY = list(attrY) if type(attrY) != str else [attrY]
         results = self.where(**search)
         arr = np.zeros((len(attrX), 2, len(results)))
         for i, x, y in zip(range(len(attrX)), attrX, attrY):

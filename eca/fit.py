@@ -447,20 +447,23 @@ class FurmanPhotoFit(FurmanBaseFit):
 
         return np.array([yc_val, alpha_val, beta_val]), np.array([yc_err, alpha_err, beta_err])
 
+
 class PhotoGammaFit(FurmanBaseFit):
     """
-    Conservative PhotoGamma fit with safeguards against explosive exponential growth
-    and denominator singularities. Uses multi-target minimization over both the 
-    function and analytical derivative.
+    Robust electron cloud buildup fit, reparametrized with:
+      - k = beta * gamma (growth/decay rate constant)
+      - w = |y0 - ys| / gamma (dimensionless shape factor)
+    
+    This maps infinite gamma values (pure exponential curves) to w = 0,
+    preventing parameter-limit pinning on decaying electron cloud curves.
     """
-    # Retained for compatibility with the Fit base class signature compilation.
-    PHOTO_GAMMA = "ys + (gamma * (y0 - ys)) / (ys - y0 + np.exp(beta * gamma * x) * (gamma - ys + y0))"
+    PHOTO_GAMMA = "ys + (y0 - ys) / (-S*w + (1 + S*w)*np.exp(k*x))"
     
     def __init__(self, selector=None, deriv_weight=0.15, conservative_exponential=True):
         super().__init__(
             "pgfit",
             self.PHOTO_GAMMA,
-            ("x", "ys", "beta", "gamma", "y0"),
+            ("x", "ys", "k", "w", "y0", "S"),
             BunchAverageSelector() if selector is None else selector
         )
         self.deriv_weight = deriv_weight
@@ -471,80 +474,102 @@ class PhotoGammaFit(FurmanBaseFit):
         y0 = Y[0]
         
         max_x = max(float(np.max(X)), 1.0)
-        is_growing = getattr(model, "buildup", True) and (Y[-1] >= Y[0])
+        max_y = float(np.max(Y)) if len(Y) > 0 else 1.0
 
-        if is_growing:
+        k_upper = max(2.0, 50.0 / max_x)
+        k_init = min(0.2, k_upper * 0.2)
+
+        if model.buildup:
+            self.fix({"S": -1})
             lim_est = self.limit_estimate(X, Y)
-            max_y = float(np.max(Y)) if len(Y) > 0 else 1.0
-            
-            ys_init = max(lim_est, max_y * 1.05)
             ys_lower = y0
-            ys_upper = max(max_y, lim_est)
+            ys_upper = max(max_y * 2.0, lim_est * 1.5, y0 + 1e-3)
+            ys_init = min(max(lim_est, max_y * 1.02), ys_upper * 0.95)
             
-            gamma_lower = max(1e-6, ys_init - y0 + 1e-4)
-            gamma_init = max(gamma_lower * 1.1, max_y)
-            gamma_upper = max(max_y * 50.0, 100.0)
-            
-            # Constrain beta upper limit dynamically to prevent vanishing gradients
-            beta_upper = max(1.0, 50.0 / max_x)
-            beta_init = min(0.1, beta_upper * 0.5)
+            # Buildup requires w < 1.0 to prevent denominator zero-crossings
+            w_lower = 0.0
+            w_upper = 0.999999
+            w_init = 0.1
         else:
+            self.fix({"S": +1})
             min_y = float(np.min(Y))
-            
-            ys_init = max(0.0, min_y)
             ys_lower = 0.0
             ys_upper = y0
+            ys_init = max(0.0, min_y)
             
-            gamma_lower = 1e-6
-            gamma_init = max(y0, 1.0)
-            gamma_upper = max(y0 * 50.0, 100.0)
-            
-            beta_upper = max(1.0, 50.0 / max_x)
-            beta_init = min(0.1, beta_upper * 0.5)
+            # Decay curves allow w >= 0; w = 0 is pure exponential decay
+            w_lower = 0.0
+            w_upper = 1e3
+            w_init = 0.05
 
         self.bound({
             "ys": (ys_lower, ys_upper),
-            "beta": (1e-6, beta_upper),
-            "gamma": (gamma_lower, gamma_upper)
+            "k": (1e-5, k_upper),
+            "w": (w_lower, w_upper)
         })
         
         self.initial({
             "ys": ys_init,
-            "beta": beta_init,
-            "gamma": gamma_init
+            "k": k_init,
+            "w": w_init
         })
 
     def _run_fit(self, X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if len(X) < 5:
             raise ValueError("Insufficient data points for PhotoGamma fitting.")
 
+        # Unit scaling for numerical stability
+        y_scale = np.max(np.abs(Y))
+        if y_scale == 0 or not np.isfinite(y_scale):
+            y_scale = 1.0
+
+        Y_norm = Y / y_scale
         X_mid = 0.5 * (X[:-1] + X[1:])
         dX = np.diff(X)
         dX = np.where(dX == 0, 1e-12, dX)
-        dYdX = np.diff(Y) / dX
+        dYdX_norm = np.diff(Y_norm) / dX
 
-        def compute_vals(x_arr, ys, beta, gamma, y0):
-            arg = np.clip(beta * gamma * x_arr, -700.0, 700.0)
+        def compute_vals(x_arr, ys, k, w, y0):
+            S = np.sign(y0 - ys)
+            if S == 0:
+                S = 1.0
+            arg = np.clip(k * x_arr, -700.0, 700.0)
             E = np.exp(arg)
-            denom = (ys - y0) + E * (gamma - ys + y0)
+            denom = -S * w + (1.0 + S * w) * E
             denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
-            return ys + (gamma * (y0 - ys)) / denom
+            return ys + (y0 - ys) / denom
 
-        def compute_deriv(x_arr, ys, beta, gamma, y0):
-            arg = np.clip(beta * gamma * x_arr, -700.0, 700.0)
+        def compute_deriv(x_arr, ys, k, w, y0):
+            S = np.sign(y0 - ys)
+            if S == 0:
+                S = 1.0
+            arg = np.clip(k * x_arr, -700.0, 700.0)
             E = np.exp(arg)
-            A = y0 - ys
-            B = gamma - ys + y0
-            denom = (ys - y0) + E * B
+            denom = -S * w + (1.0 + S * w) * E
             denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
-            return (beta * (gamma**2) * A * B * E) / np.square(denom)
+            return -(k * (y0 - ys) * (1.0 + S * w) * E) / np.square(denom)
+
+        free_mask = ~self.fixed
+        
+        # Scale ys and y0; k and w are scale-invariant
+        p0 = self.initial_guess[free_mask].copy()
+        bounds_lower = self.bounds_lower[free_mask].copy()
+        bounds_upper = self.bounds_upper[free_mask].copy()
+        
+        # Mapping: index 0: ys, index 1: k, index 2: w
+        p0[0] /= y_scale
+        bounds_lower[0] /= y_scale
+        bounds_upper[0] /= y_scale
+
+        fixed_vals_norm = self.fixed_values.copy()
+        fixed_vals_norm[3] /= y_scale  # y0 is index 3
 
         def get_full_params(p_free):
             params = np.empty(4)
             free_ptr = 0
             for i in range(4):
                 if self.fixed[i]:
-                    params[i] = self.fixed_values[i]
+                    params[i] = fixed_vals_norm[i]
                 else:
                     params[i] = p_free[free_ptr]
                     free_ptr += 1
@@ -558,54 +583,45 @@ class PhotoGammaFit(FurmanBaseFit):
             if not (np.all(np.isfinite(y_pred)) and np.all(np.isfinite(d_pred))):
                 return 1e12
 
-            res_y = y_pred - Y
-            res_d = d_pred - dYdX
+            res_y = y_pred - Y_norm
+            res_d = d_pred - dYdX_norm
             loss = np.sum(np.square(res_y)) + self.deriv_weight * np.sum(np.square(res_d))
             
             return loss if np.isfinite(loss) else 1e12
 
-        # ---------------------------------------------------------
-        # NEW: Explicit Singularity Constraint for SLSQP
-        # Ensures: gamma - ys + y0 >= 1e-5
-        # ---------------------------------------------------------
-        def singularity_constraint(p_free):
-            ys_val, _, gamma_val, y0_val = get_full_params(p_free)
-            return (gamma_val - ys_val + y0_val) - 1e-5
-            
-        constraints = [{'type': 'ineq', 'fun': singularity_constraint}]
+        bounds = list(zip(bounds_lower, bounds_upper))
 
-        free_mask = ~self.fixed
-        p0 = self.initial_guess[free_mask]
-        bounds = list(zip(self.bounds_lower[free_mask], self.bounds_upper[free_mask]))
-
-        # Switched method to SLSQP to utilize the constraints argument
         opt_res = minimize(
-            objective, p0, bounds=bounds, method="SLSQP", constraints=constraints,
+            objective, p0, bounds=bounds, method="SLSQP",
             options={"maxiter": 10000, "ftol": 1e-12}
         )
 
         if not opt_res.success:
             raise RuntimeError(f"PhotoGamma SLSQP optimization failed: {opt_res.message}")
 
-        opt_params = opt_res.x
+        opt_params_norm = opt_res.x
 
-        # Calculate standard uncertainties via Jacobian matrix estimation
+        # Un-normalize parameters
+        opt_params = opt_params_norm.copy()
+        opt_params[0] *= y_scale  # ys (k and w remain unscaled)
+
+        # Uncertainty estimation
         eps = 1e-6
-        n_obs = len(Y) + len(dYdX)
-        n_param = len(opt_params)
+        n_obs = len(Y_norm) + len(dYdX_norm)
+        n_param = len(opt_params_norm)
         J = np.zeros((n_obs, n_param))
 
         def compute_res(p_free):
             p_full = get_full_params(p_free)
             y_pred = compute_vals(X, *p_full)
             d_pred = compute_deriv(X_mid, *p_full)
-            return np.concatenate([y_pred - Y, np.sqrt(self.deriv_weight) * (d_pred - dYdX)])
+            return np.concatenate([y_pred - Y_norm, np.sqrt(self.deriv_weight) * (d_pred - dYdX_norm)])
 
-        r0 = compute_res(opt_params)
+        r0 = compute_res(opt_params_norm)
 
         for i in range(n_param):
-            p_step = opt_params.copy()
-            step = max(abs(opt_params[i]) * eps, eps)
+            p_step = opt_params_norm.copy()
+            step = max(abs(opt_params_norm[i]) * eps, eps)
             p_step[i] += step
             r_step = compute_res(p_step)
             J[:, i] = (r_step - r0) / step
@@ -616,7 +632,9 @@ class PhotoGammaFit(FurmanBaseFit):
         
         try:
             cov = np.linalg.inv(jtj) * s_sq
-            perr = np.sqrt(np.maximum(0.0, np.diag(cov)))
+            perr_norm = np.sqrt(np.maximum(0.0, np.diag(cov)))
+            perr = perr_norm.copy()
+            perr[0] *= y_scale
         except np.linalg.LinAlgError:
             perr = np.zeros_like(opt_params)
 
