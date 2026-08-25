@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.optimize import curve_fit, minimize
 from scipy.constants import c
+from scipy.special import expit
+from scipy.optimize import least_squares
 from functools import partial as functools_partial
 from typing import Any, Callable, Iterable
 from tinydb.middlewares import CachingMiddleware
@@ -448,28 +450,29 @@ class FurmanPhotoFit(FurmanBaseFit):
         return np.array([yc_val, alpha_val, beta_val]), np.array([yc_err, alpha_err, beta_err])
 
 
-class PhotoGammaFit(FurmanBaseFit):
+class KTYFit(FurmanBaseFit):
     """
-    Robust electron cloud buildup fit, reparametrized with:
-      - k = beta * gamma (growth/decay rate constant)
-      - w = |y0 - ys| / gamma (dimensionless shape factor)
-    
-    This maps infinite gamma values (pure exponential curves) to w = 0,
-    preventing parameter-limit pinning on decaying electron cloud curves.
+    Unconditionally stable fit using a logistic sigmoid shape mapping (theta).
+    - k: growth/decay rate constant
+    - theta: log-odds shape parameter (w = expit(theta)).
+             For buildup, x_delay = theta / k defines the bunch passage knee index.
+             
+    Models electron number densities cleanly across buildup and decay regimes.
     """
-    PHOTO_GAMMA = "ys + (y0 - ys) / (-S*w + (1 + S*w)*np.exp(k*x))"
+    # Aligned exactly with Equation 18 from the paper
+    KTY = "ys + (y0 - ys) / (S * (1.0 / (1.0 + np.exp(-theta))) + (1.0 - S * (1.0 / (1.0 + np.exp(-theta)))) * np.exp(k * x))"    
     
     def __init__(self, selector=None, deriv_weight=0.15, conservative_exponential=True):
         super().__init__(
-            "pgfit",
-            self.PHOTO_GAMMA,
-            ("x", "ys", "k", "w", "y0", "S"),
+            "kty",
+            self.KTY,
+            ("x", "ys", "k", "theta", "y0", "S"),
             BunchAverageSelector() if selector is None else selector
         )
         self.deriv_weight = deriv_weight
         self.conservative_exponential = conservative_exponential
 
-    def _configure_fit(self, model: "ECModel", X: np.ndarray, Y: np.ndarray):
+    def _configure_fit(self, model, X: np.ndarray, Y: np.ndarray):
         self.fix({"y0": Y[0]})
         y0 = Y[0]
         
@@ -479,46 +482,44 @@ class PhotoGammaFit(FurmanBaseFit):
         k_upper = max(2.0, 50.0 / max_x)
         k_init = min(0.2, k_upper * 0.2)
 
+        theta_lower = -30.0
+        theta_upper = 30.0
+
         if model.buildup:
-            self.fix({"S": -1})
+            self.fix({"S": 1.0})  # Paper definition: S = +1 for buildup
             lim_est = self.limit_estimate(X, Y)
             ys_lower = y0
             ys_upper = max(max_y * 2.0, lim_est * 1.5, y0 + 1e-3)
             ys_init = min(max(lim_est, max_y * 1.02), ys_upper * 0.95)
             
-            # Buildup requires w < 1.0 to prevent denominator zero-crossings
-            w_lower = 0.0
-            w_upper = 0.999999
-            w_init = 0.1
+            # theta = 2.0 corresponds to w ≈ 0.88 (moderate sigmoidal delay)
+            theta_init = 2.0
         else:
-            self.fix({"S": +1})
+            self.fix({"S": -1.0}) # Paper definition: S = -1 for decay
             min_y = float(np.min(Y))
             ys_lower = 0.0
             ys_upper = y0
             ys_init = max(0.0, min_y)
             
-            # Decay curves allow w >= 0; w = 0 is pure exponential decay
-            w_lower = 0.0
-            w_upper = 1e3
-            w_init = 0.05
+            # theta = -5.0 corresponds to w ≈ 0.006 (pure exponential decay)
+            theta_init = -5.0
 
         self.bound({
             "ys": (ys_lower, ys_upper),
             "k": (1e-5, k_upper),
-            "w": (w_lower, w_upper)
+            "theta": (theta_lower, theta_upper)
         })
         
         self.initial({
             "ys": ys_init,
             "k": k_init,
-            "w": w_init
+            "theta": theta_init
         })
 
     def _run_fit(self, X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if len(X) < 5:
-            raise ValueError("Insufficient data points for PhotoGamma fitting.")
+            raise ValueError("Insufficient data points for KTY fitting.")
 
-        # Unit scaling for numerical stability
         y_scale = np.max(np.abs(Y))
         if y_scale == 0 or not np.isfinite(y_scale):
             y_scale = 1.0
@@ -529,34 +530,30 @@ class PhotoGammaFit(FurmanBaseFit):
         dX = np.where(dX == 0, 1e-12, dX)
         dYdX_norm = np.diff(Y_norm) / dX
 
-        def compute_vals(x_arr, ys, k, w, y0):
-            S = np.sign(y0 - ys)
-            if S == 0:
-                S = 1.0
+        # Updated to precisely match the paper's denominator logic
+        def compute_vals(x_arr, ys, k, theta, y0, S):
+            w = expit(theta)
             arg = np.clip(k * x_arr, -700.0, 700.0)
             E = np.exp(arg)
-            denom = -S * w + (1.0 + S * w) * E
+            denom = S * w + (1.0 - S * w) * E
             denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
             return ys + (y0 - ys) / denom
 
-        def compute_deriv(x_arr, ys, k, w, y0):
-            S = np.sign(y0 - ys)
-            if S == 0:
-                S = 1.0
+        def compute_deriv(x_arr, ys, k, theta, y0, S):
+            w = expit(theta)
             arg = np.clip(k * x_arr, -700.0, 700.0)
             E = np.exp(arg)
-            denom = -S * w + (1.0 + S * w) * E
+            denom = S * w + (1.0 - S * w) * E
             denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
-            return -(k * (y0 - ys) * (1.0 + S * w) * E) / np.square(denom)
+            return -(k * (y0 - ys) * (1.0 - S * w) * E) / np.square(denom)
 
         free_mask = ~self.fixed
         
-        # Scale ys and y0; k and w are scale-invariant
         p0 = self.initial_guess[free_mask].copy()
         bounds_lower = self.bounds_lower[free_mask].copy()
         bounds_upper = self.bounds_upper[free_mask].copy()
         
-        # Mapping: index 0: ys, index 1: k, index 2: w
+        # Scale ys; k and theta are invariant to the number density magnitude
         p0[0] /= y_scale
         bounds_lower[0] /= y_scale
         bounds_upper[0] /= y_scale
@@ -565,9 +562,9 @@ class PhotoGammaFit(FurmanBaseFit):
         fixed_vals_norm[3] /= y_scale  # y0 is index 3
 
         def get_full_params(p_free):
-            params = np.empty(4)
+            params = np.empty(5)
             free_ptr = 0
-            for i in range(4):
+            for i in range(5):
                 if self.fixed[i]:
                     params[i] = fixed_vals_norm[i]
                 else:
@@ -575,60 +572,49 @@ class PhotoGammaFit(FurmanBaseFit):
                     free_ptr += 1
             return params
 
-        def objective(p_free):
+        # Objective reformatted to return an array of residuals for least_squares
+        def compute_residuals(p_free):
             params = get_full_params(p_free)
             y_pred = compute_vals(X, *params)
             d_pred = compute_deriv(X_mid, *params)
 
             if not (np.all(np.isfinite(y_pred)) and np.all(np.isfinite(d_pred))):
-                return 1e12
+                # Return a heavily penalized residual array if divergent
+                return np.full(len(Y_norm) + len(dYdX_norm), 1e6)
 
             res_y = y_pred - Y_norm
             res_d = d_pred - dYdX_norm
-            loss = np.sum(np.square(res_y)) + self.deriv_weight * np.sum(np.square(res_d))
             
-            return loss if np.isfinite(loss) else 1e12
+            # Multiply derivative residuals by sqrt of weight so squares naturally weight properly
+            return np.concatenate([res_y, np.sqrt(self.deriv_weight) * res_d])
 
-        bounds = list(zip(bounds_lower, bounds_upper))
-
-        opt_res = minimize(
-            objective, p0, bounds=bounds, method="SLSQP",
-            options={"maxiter": 10000, "ftol": 1e-12}
+        opt_res = least_squares(
+            compute_residuals, 
+            p0, 
+            bounds=(bounds_lower, bounds_upper), 
+            method="trf",
+            ftol=1e-12,
+            xtol=1e-12,
+            gtol=1e-12
         )
 
         if not opt_res.success:
-            raise RuntimeError(f"PhotoGamma SLSQP optimization failed: {opt_res.message}")
+            raise RuntimeError(f"KTYFit TRF optimization failed: {opt_res.message}")
 
         opt_params_norm = opt_res.x
 
-        # Un-normalize parameters
         opt_params = opt_params_norm.copy()
-        opt_params[0] *= y_scale  # ys (k and w remain unscaled)
+        opt_params[0] *= y_scale  
 
-        # Uncertainty estimation
-        eps = 1e-6
-        n_obs = len(Y_norm) + len(dYdX_norm)
-        n_param = len(opt_params_norm)
-        J = np.zeros((n_obs, n_param))
-
-        def compute_res(p_free):
-            p_full = get_full_params(p_free)
-            y_pred = compute_vals(X, *p_full)
-            d_pred = compute_deriv(X_mid, *p_full)
-            return np.concatenate([y_pred - Y_norm, np.sqrt(self.deriv_weight) * (d_pred - dYdX_norm)])
-
-        r0 = compute_res(opt_params_norm)
-
-        for i in range(n_param):
-            p_step = opt_params_norm.copy()
-            step = max(abs(opt_params_norm[i]) * eps, eps)
-            p_step[i] += step
-            r_step = compute_res(p_step)
-            J[:, i] = (r_step - r0) / step
-
+        # least_squares automatically provides the Jacobian at the optimal solution
+        J = opt_res.jac
         jtj = J.T @ J
+        
+        n_obs = len(opt_res.fun)
+        n_param = len(opt_params_norm)
         dof = max(1, n_obs - n_param)
-        s_sq = np.sum(np.square(r0)) / dof
+        
+        s_sq = np.sum(np.square(opt_res.fun)) / dof
         
         try:
             cov = np.linalg.inv(jtj) * s_sq
@@ -639,7 +625,6 @@ class PhotoGammaFit(FurmanBaseFit):
             perr = np.zeros_like(opt_params)
 
         return opt_params, perr
-
 
 def fit_all_where(db: SimDB, fit: Fit, refit: bool = False, verbose: bool = True, **search):
     """

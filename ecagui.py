@@ -16,7 +16,7 @@ import numpy as np
 try:
     from eca import SimDB, ECModel, WhereIn
     from eca.fit import (
-        FurmanNoPhotoFit, FurmanPhotoFit, FurmanNPMCFit, PhotoGammaFit, 
+        FurmanNoPhotoFit, FurmanPhotoFit, FurmanNPMCFit, KTYFit, 
         BeforeBunchSelector, BunchAverageSelector
     )
     from eca.plots import model_plot, versus_plot, histogram_plot
@@ -132,7 +132,7 @@ class ECAApp:
         "FurmanNoPhoto": FurmanNoPhotoFit,
         "FurmanNPMC": FurmanNPMCFit,
         "FurmanPhoto": FurmanPhotoFit,
-        "PhotoGamma": PhotoGammaFit
+        "KTY": KTYFit
     }
     
     def __init__(self, root: tk.Tk, handler: Optional[ECADatabaseHandler] = None, is_temp: bool = False):

@@ -117,9 +117,11 @@ class TemplateSim(object):
 
         values = {**self.defaults, **changes}
         skip_resource = set()
+        wrote_values = 0
         for filename in DBFolder.FILENAMES.values():
             if filename != DBFolder.FILENAMES["data"]:
                 this_file = [prop for prop in values.keys() if prop in self.property_map and self.property_map[prop] == filename]
+                wrote_values += len(this_file)
                 contents = "#PyECLOUD Configuration from Template {}\n\n".format(self.path)
                 for prop in sorted(this_file):
                     value = values[prop]
@@ -138,6 +140,8 @@ class TemplateSim(object):
                     contents += "{} = {}\n".format(prop, ("\"" + value + "\"" if type(value) == str else value) if not isinstance(value, np.ndarray) else value.tolist())
                 with open(os.path.join(path, filename), "w") as f:
                     f.write(contents)
+        if len(values) > wrote_values:
+            raise ValueError("Properties were set that were not found in any template file!")
         for resource in self.resources:
             if resource not in skip_resource:
                 rsrc, rdest = realpath(os.path.join(self.path, resource)), realpath(os.path.join(path, resource))
@@ -414,16 +418,20 @@ class SimDB(object):
             model.ensure(attr, lambda: generator(model))
         return [wa.doc_id for wa in without_attr]
 
-    def extract(self, attrs: Iterable[str], **search) -> SimDB:
+    def extract(self, attrs: Iterable[str] | None, **search) -> SimDB:
         """
         Create a sub-database, extracting the properties "attrs" from documents matching the query.
+        if attrs is None, include all attributes
         Ignores missing properties.
         """
-        if not isinstance(attrs, tuple):
+        if isinstance(attrs, Iterable):
             attrs = tuple(attrs)
         sdb = TinyDB(storage=MemoryStorage)
         for result in self.where(**search):
-            sdb.insert({k: result[k] for k in attrs if k in result})
+            if attrs is None:
+                sdb.insert(result)
+            else:
+                sdb.insert({k: result[k] for k in attrs if k in result})
         return SimDB(sdb, [], self.verbose)
 
     def extract_array(self, attrs: Iterable[str], **search) -> tuple[np.ndarray, list]:
